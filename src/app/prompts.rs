@@ -8,7 +8,7 @@ use crate::out::{self, Fg};
 use super::Run;
 
 /// The no-UI prompts: the roster's account letters, then the remote question.
-pub(super) fn fallback_prompts(run: &Run, choice: &mut String, remote: &mut bool, qr: &mut bool, stop: &mut bool) {
+pub(super) fn fallback_prompts(run: &Run, choice: &mut String, remote: &mut bool) {
     let accounts = &run.cfg.accounts;
     let prefixes = account_prefixes(accounts.iter().map(|a| a.key.as_str()).collect::<Vec<_>>().as_slice());
     let visible: Vec<&config::Account> = accounts.iter().filter(|a| !a.hidden).collect();
@@ -29,15 +29,9 @@ pub(super) fn fallback_prompts(run: &Run, choice: &mut String, remote: &mut bool
         *choice = resolve_account_answer(&answer, &prefixes, choice);
     }
     if run.cfg.remote {
-        out::inline("Remote: [Enter] on / [n] off / [q] on + QR / [s] stop server + off : ", Fg::Cyan);
-        let a = read_line();
-        if a.starts_with('n') {
+        out::inline("Remote: [Enter] on / [n] off : ", Fg::Cyan);
+        if read_line().starts_with('n') {
             *remote = false;
-        } else if a.starts_with('q') {
-            *qr = true;
-        } else if a.starts_with('s') {
-            *remote = false;
-            *stop = true;
         }
     }
 }

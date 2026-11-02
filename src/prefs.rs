@@ -171,10 +171,6 @@ pub fn build_prefs_data(prev: &Prefs, state: &LaunchState, now_ms: i64, roster: 
             continue;
         }
         let v = state.get(f);
-        if f == RowName::Remote && v.eq_ignore_ascii_case("stop server") {
-            entry.insert(key.into(), json!("off"));
-            continue;
-        }
         if v.eq_ignore_ascii_case("default") {
             if let Some(p) = prev_entry
                 .get(key)

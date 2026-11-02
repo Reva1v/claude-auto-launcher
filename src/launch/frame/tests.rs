@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::launch::tests::four;
+use crate::types::LimitRecord;
 
 const NOW_LABELS: [(&str, &str); 4] = [
     ("Model", "Opus 5.5[1M]"),
@@ -165,7 +166,7 @@ fn wide_frames_match_the_powershell_goldens() {
 }
 
 #[test]
-fn narrow_tier_draws_compact_rows_and_one_limit_line() {
+fn narrow_tier_draws_compact_rows() {
     let r = four();
     let limits = golden_limits();
     let s = r.new_state();
@@ -185,11 +186,6 @@ fn narrow_tier_draws_compact_rows_and_one_limit_line() {
     };
     let f = launch_frame(&r, &inp);
     assert!(f.lines.iter().all(|l| display_width(l) <= 49), "{:#?}", f.lines);
-    assert!(
-        f.lines.iter().any(|l| l == "   5h     41%   7d     63%   fable  15%"),
-        "the usage row keeps the model bucket before the age: {:#?}",
-        f.lines
-    );
     assert!(
         f.lines.iter().any(|l| l == "   effort       < default >"),
         "too wide rows collapse: {:#?}",
@@ -224,17 +220,6 @@ fn frame_at(r: &Roster, s: &LaunchState, limits: &Limits, width: usize) -> Frame
     launch_frame(r, &inp)
 }
 
-/// The column where the values of the row named `name` start.
-fn value_column(f: &Frame, r: &Roster, name: &str) -> usize {
-    let hit = f.map.rows.iter().find(|h| h.name == name).unwrap();
-    let line = &f.lines[usize::try_from(hit.y).unwrap()];
-    let label = r.rows[hit.index].label;
-    let chars: Vec<char> = line.chars().collect();
-    let label: Vec<char> = label.chars().collect();
-    let at = chars.windows(label.len()).position(|w| w == label.as_slice()).unwrap() + label.len();
-    at + chars.iter().skip(at).take_while(|c| **c == ' ' || **c == '*').count()
-}
-
 #[test]
 fn a_narrow_row_collapses_only_when_it_does_not_fit() {
     let r = four();
@@ -254,43 +239,28 @@ fn a_narrow_row_collapses_only_when_it_does_not_fit() {
     assert!(narrow.lines[usize::try_from(model.y).unwrap()].contains('‹'), "{:#?}", narrow.lines);
 }
 
+/// (local) The percent beside the account name is all that is left of the limits.
 #[test]
-fn the_usage_row_starts_on_the_value_column_and_keeps_the_model_bucket() {
+fn limits_show_only_as_the_percent_beside_the_account() {
     let r = four();
-    let personal: Limits = [(
-        "work".to_owned(),
-        LimitRecord {
-            five_hour: None,
-            seven_day: Some(83),
-            age_text: "just now".into(),
-            model: Some(1),
-            model_label: Some("FABLE".into()),
-            available_models: None,
-        },
-    )]
-    .into();
+    let limits = golden_limits();
     let s = r.new_state();
-    for limits in [golden_limits(), personal] {
-        for width in [50, 58, 60, 80, 100, 120] {
-            let f = frame_at(&r, &s, &limits, width);
-            let account_y = usize::try_from(f.map.rows.iter().find(|h| h.name == "Account").unwrap().y).unwrap();
-            let usage = &f.lines[account_y + 1];
-            let col = value_column(&f, &r, "Model");
-            let lead = usage.chars().take_while(|c| *c == ' ').count();
-            assert!(
-                lead == col || (width < 100 && lead == 3),
-                "{width}: value or label column: {usage:?}"
-            );
-            assert!(usage.contains("fable"), "{width}: {usage:?}");
-            assert!(usage.contains("7d "), "{width}: {usage:?}");
-            let l = &limits["work"];
-            if width >= 58 {
-                assert!(usage.contains("fable") && usage.ends_with(&l.age_text), "{width}: {usage:?}");
-            }
-            if width >= 80 || (width >= 58 && l.five_hour.is_none()) {
-                assert!(usage.contains('░'), "{width}: bars kept: {usage:?}");
-            }
+    for width in [50, 58, 60, 80, 100, 120] {
+        let f = frame_at(&r, &s, &limits, width);
+        let account_y = usize::try_from(f.map.rows.iter().find(|h| h.name == "Account").unwrap().y).unwrap();
+        if width >= 80 {
+            assert!(f.lines[account_y].contains("[work 41%]"), "{width}: {:?}", f.lines[account_y]);
         }
+        assert!(
+            f.lines[account_y + 1].starts_with("   remote"),
+            "{width}: {:?}",
+            f.lines[account_y + 1]
+        );
+        let text = f.lines.join(
+            "
+",
+        );
+        assert!(!text.contains("7d") && !text.contains("min ago"), "{width}: {text}");
     }
 }
 

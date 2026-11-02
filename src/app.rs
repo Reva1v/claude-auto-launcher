@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::config::{self, Config, PathCtx};
 use crate::launch::screen::LaunchView;
-use crate::launch::{LAUNCH_MODES, LaunchState, Roster, launch_args};
+use crate::launch::{LaunchState, Roster, launch_args};
 use crate::log::{self, Logger};
 use crate::log_data;
 use crate::out::{self, Fg};
@@ -193,8 +193,6 @@ fn launch(run: &Run) -> i32 {
     }
     let mut choice = run.roster.default_account().to_owned();
     let mut remote_on = run.cfg.remote;
-    let mut show_qr = false;
-    let mut stop_server = false;
     let mut ui: Option<UiOutcome> = None;
     if use_ui {
         let ui_span = run.logger.timings.begin(&["ui"]);
@@ -216,7 +214,7 @@ fn launch(run: &Run) -> i32 {
             }
             Ok(UiEnd::NoConsole) => {
                 use_ui = false;
-                fallback_prompts(run, &mut choice, &mut remote_on, &mut show_qr, &mut stop_server);
+                fallback_prompts(run, &mut choice, &mut remote_on);
             }
             Err(e) => {
                 run.logger.write(
@@ -228,7 +226,7 @@ fn launch(run: &Run) -> i32 {
             }
         }
     } else if !input_redirected && run.args.is_empty() {
-        fallback_prompts(run, &mut choice, &mut remote_on, &mut show_qr, &mut stop_server);
+        fallback_prompts(run, &mut choice, &mut remote_on);
     }
 
     let mut child = ChildEnv::default();
@@ -247,16 +245,8 @@ fn launch(run: &Run) -> i32 {
             child.set("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1");
         }
         choice.clone_from(&o.state.account);
-        if run.cfg.remote {
-            match o.state.remote.as_str() {
-                "off" => remote_on = false,
-                "on+QR" => show_qr = true,
-                "stop server" => {
-                    remote_on = false;
-                    stop_server = true;
-                }
-                _ => {}
-            }
+        if run.cfg.remote && o.state.remote == "off" {
+            remote_on = false;
         }
         if !run.preview {
             run.logger.write(
@@ -359,19 +349,6 @@ fn launch(run: &Run) -> i32 {
         }
         None => run.args.clone(),
     };
-    let off_modes: Vec<&str> = LAUNCH_MODES
-        .iter()
-        .filter(|m| !m.remote_off.is_empty() && !m.flag.is_empty() && launch_argv.iter().any(|a| a == m.flag))
-        .map(|m| m.remote_off)
-        .collect();
-    let selects_session = !off_modes.is_empty();
-    if selects_session && remote_on {
-        out::line(
-            &format!("  remote off for this session: {}", off_modes.last().copied().unwrap_or_default()),
-            Fg::DarkYellow,
-        );
-        remote_on = false;
-    }
     let argv = invocation::claude_invocation(&launch_argv, &mcp);
 
     if run.preview {
@@ -384,49 +361,20 @@ fn launch(run: &Run) -> i32 {
                 Fg::Plain,
             );
         }
-        preview_summary(&choice, &child, remote_on, show_qr, stop_server, &launch_argv, &claude, &argv);
+        preview_summary(&choice, &child, remote_on, &launch_argv, &claude, &argv);
         return 0;
     }
-    if stop_server {
-        match remote::stop_companion_server() {
-            Ok(s) => out::line(&format!("  companion server: {s}"), Fg::Yellow),
-            Err(e) => out::line(&format!("  companion server stop failed: {e}"), Fg::DarkYellow),
-        }
-    }
-    if run.cfg.remote && !remote_on && !selects_session {
-        out::line(
-            "  remote off for this session - plain claude, not reachable from the phone",
-            Fg::DarkGray,
-        );
-    }
-    let no_roam = var("CLAUDE_NO_ROAM").as_deref() == Some("1");
-    if run.cfg.remote && !selects_session && !no_roam && remote_on && (use_ui || launch_argv.is_empty()) {
-        let req = remote::CrcLaunch {
-            argv: &argv,
-            account: &choice,
-            show_qr,
-            child: &child,
+    // (local) The bridge serves every live session, so the row switches it for all of them; a launch
+    // with arguments (`-p`, a script) leaves it alone.
+    if run.cfg.remote && (use_ui || launch_argv.is_empty()) {
+        let status = if remote_on {
+            remote::ensure_bridge()
+        } else {
+            remote::stop_bridge()
         };
-        if let Some(exe) = remote::crc_path() {
-            run.logger.write(
-                "decision",
-                log_data! {
-                    "via" => "crc", "exe" => exe.to_string_lossy(), "account" => choice, "useUi" => use_ui,
-                    "remote" => remote_on, "mcpConfigs" => mcp, "argv" => argv, "ms" => ms(run),
-                },
-            );
+        if let Some(status) = status {
+            out::line(&format!("  remote: {status}"), Fg::DarkGray);
         }
-        tm.end(run.process);
-        run.logger.write_timings();
-        if let Some(code) = remote::launch_via_crc(&req) {
-            run.logger
-                .write("exit", log_data! { "via" => "crc", "code" => code, "ms" => ms(run) });
-            return code;
-        }
-        out::line(
-            "  crc not on PATH - plain session, not reachable from the phone (npm link in the server/ directory)",
-            Fg::DarkYellow,
-        );
     }
     run.logger.write(
         "decision",
@@ -456,17 +404,7 @@ fn preview_banner(title: &str) {
     );
 }
 
-#[expect(clippy::too_many_arguments, reason = "one line per preview field")]
-fn preview_summary(
-    choice: &str,
-    child: &ChildEnv,
-    remote: bool,
-    qr: bool,
-    stop: bool,
-    launch_argv: &[String],
-    claude: &Path,
-    argv: &[String],
-) {
+fn preview_summary(choice: &str, child: &ChildEnv, remote: bool, launch_argv: &[String], claude: &Path, argv: &[String]) {
     let ps_bool = |b: bool| if b { "True" } else { "False" };
     out::line("", Fg::Plain);
     out::line("--- preview, nothing launched ---", Fg::Cyan);
@@ -475,15 +413,7 @@ fn preview_summary(
         &format!("CLAUDE_CONFIG_DIR  : {}", child.effective("CLAUDE_CONFIG_DIR").unwrap_or_default()),
         Fg::Plain,
     );
-    out::line(
-        &format!(
-            "remote             : {}   qr={}   stopServer={}",
-            ps_bool(remote),
-            ps_bool(qr),
-            ps_bool(stop)
-        ),
-        Fg::Plain,
-    );
+    out::line(&format!("remote             : {}", ps_bool(remote)), Fg::Plain);
     let advisor = if child.effective("CLAUDE_CODE_DISABLE_ADVISOR_TOOL").as_deref() == Some("1") {
         "disabled (CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1)"
     } else {

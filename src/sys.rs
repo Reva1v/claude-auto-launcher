@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::ptr;
 
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0};
-use windows_sys::Win32::NetworkManagement::IpHelper::{GetExtendedTcpTable, GetIpAddrTable, TCP_TABLE_OWNER_PID_LISTENER};
+use windows_sys::Win32::NetworkManagement::IpHelper::{GetExtendedTcpTable, TCP_TABLE_OWNER_PID_LISTENER};
 use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
 use windows_sys::Win32::System::Console::{
@@ -346,8 +346,6 @@ pub(crate) fn u32_at(b: &[u8], off: usize) -> Option<u32> {
 pub(crate) enum IpTable {
     /// `GetExtendedTcpTable`, listeners with their owning pid.
     TcpListeners(Family),
-    /// `GetIpAddrTable`.
-    Ipv4Addresses,
 }
 
 /// Calls the table's IP Helper function until the buffer fits; the bytes it filled. The call
@@ -369,8 +367,6 @@ pub(crate) fn sized_table(table: IpTable) -> Option<Vec<u8>> {
                 // live across the call; the function writes no more than `*len` bytes.
                 unsafe { GetExtendedTcpTable(out, len, 0, af, TCP_TABLE_OWNER_PID_LISTENER, 0) }
             }
-            // SAFETY: as above; MIB_IPADDRTABLE needs 4-byte alignment and `buf` is u64-aligned.
-            IpTable::Ipv4Addresses => unsafe { GetIpAddrTable(out.cast(), len, 0) },
         };
         match rc {
             0 => return Some(buf.iter().flat_map(|w| w.to_ne_bytes()).take(size as usize).collect()),

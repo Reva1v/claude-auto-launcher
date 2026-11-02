@@ -1,6 +1,6 @@
 use super::*;
 
-const ROOT: &str = r"C:\Users\someone\Projects\remote-control-claude-code";
+const ROOT: &str = r"C:\Users\someone\Projects\claude-tg-bridge";
 
 /// Records what the stop seam saw.
 struct Fake {
@@ -35,116 +35,121 @@ fn fake(listener: Option<u32>, name: &str, cmd: &str) -> Fake {
     }
 }
 
-fn stop(f: &mut Fake) -> String {
-    stop_with(Path::new(ROOT), 8791, f)
+fn stop(f: &mut Fake) -> Option<String> {
+    stop_with(Path::new(ROOT), 8787, f)
+}
+
+fn temp_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("claude-auto-rs-bridge-{tag}-{}", crate::log::new_run_id()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
 }
 
 #[test]
-fn nothing_listening_stops_nothing() {
+fn nothing_listening_stops_nothing_and_says_nothing() {
     let mut f = fake(None, "", "");
-    assert!(stop(&mut f).contains("nothing listening"));
-    assert_eq!(f.stopped.len(), 0);
+    assert_eq!(stop(&mut f), None);
+    assert_eq!(f.stopped, Vec::<u32>::new());
 }
 
 #[test]
-fn a_dead_pid_reads_as_already_stopped() {
+fn a_dead_pid_is_not_stopped() {
     let mut f = fake(Some(4242), "", "");
-    assert!(stop(&mut f).contains("stale socket entry"));
-    assert_eq!(f.stopped.len(), 0);
+    assert_eq!(stop(&mut f), None);
+    assert_eq!(f.stopped, Vec::<u32>::new());
 }
 
 #[test]
-fn a_node_from_another_checkout_is_left_alone_and_named() {
-    let mut f = fake(Some(32620), "node", r"node C:\Users\someone\Projects\something-else\server.js");
-    let r = stop(&mut f);
-    assert_eq!(f.stopped.len(), 0);
-    assert!(r.contains("not the companion server") && r.contains("32620"));
+fn another_process_on_the_port_survives_off() {
+    let mut f = fake(Some(13308), "tsh", "tsh proxy app unic-adapter --port 8787");
+    assert_eq!(stop(&mut f), None);
+    assert_eq!(f.stopped, Vec::<u32>::new());
+}
+
+#[test]
+fn a_node_from_another_checkout_is_left_alone() {
+    let mut f = fake(
+        Some(1),
+        "node",
+        r"node C:\Users\someone\Projects\claude-tg-bridge-old\dist\index.js",
+    );
+    stop(&mut f);
+    assert_eq!(f.stopped, Vec::<u32>::new());
 }
 
 #[test]
 fn a_non_node_process_is_not_stopped_even_from_the_right_directory() {
-    let mut f = fake(Some(4242), "python", &format!("python serve.py {ROOT}"));
-    let r = stop(&mut f);
-    assert_eq!(f.stopped.len(), 0);
-    assert!(r.contains("python"));
+    let mut f = fake(Some(1), "python", &format!(r"python {ROOT}\dist\serve.py"));
+    stop(&mut f);
+    assert_eq!(f.stopped, Vec::<u32>::new());
 }
 
 #[test]
 fn an_unreadable_command_line_is_not_a_match() {
-    let mut f = fake(Some(4242), "node", "");
+    let mut f = fake(Some(1), "node", "");
     stop(&mut f);
-    assert_eq!(f.stopped.len(), 0);
+    assert_eq!(f.stopped, Vec::<u32>::new());
 }
 
 #[test]
-fn the_real_companion_is_stopped() {
-    let mut f = fake(Some(777), "node", &format!(r"node {ROOT}\server\dist\index.js"));
-    let r = stop(&mut f);
+fn the_real_bridge_is_stopped() {
+    let mut f = fake(Some(777), "node", &format!(r"node {ROOT}\dist\index.js"));
+    assert!(stop(&mut f).unwrap().contains("stopped"));
     assert_eq!(f.stopped, vec![777]);
-    assert!(r.contains("stopped pid 777"));
 }
 
 #[test]
-fn forward_slashes_still_match_the_root() {
-    let mut f = fake(
-        Some(1),
-        "node",
-        "node C:/Users/someone/Projects/remote-control-claude-code/server/dist/index.js",
-    );
+fn forward_slashes_and_case_still_match_the_root() {
+    let mut f = fake(Some(1), "Node", "node c:/users/someone/projects/claude-tg-bridge/dist/index.js");
     stop(&mut f);
     assert_eq!(f.stopped.len(), 1);
 }
 
 #[test]
 fn a_failing_stop_is_a_status_line() {
-    let mut f = fake(Some(1), "node", &format!(r"node {ROOT}\server\dist\index.js"));
+    let mut f = fake(Some(1), "node", &format!(r"node {ROOT}\dist\index.js"));
     f.fail = Some("access is denied".into());
-    assert!(stop(&mut f).contains("access is denied"));
+    assert!(stop(&mut f).unwrap().contains("access is denied"));
 }
 
 #[test]
 fn root_resolution() {
     let home = Path::new(r"C:\Users\x");
-    assert_eq!(companion_root(Some(r"D:\checkouts\crc"), home), PathBuf::from(r"D:\checkouts\crc"));
-    assert_eq!(
-        companion_root(Some(""), home),
-        home.join("Desktop").join("Projects").join("remote-control-claude-code")
-    );
+    assert_eq!(bridge_root(Some(r"D:\p\bridge"), home), PathBuf::from(r"D:\p\bridge"));
+    assert_eq!(bridge_root(Some(""), home), home.join("claude-tg-bridge"));
+    assert_eq!(bridge_root(None, home), home.join("claude-tg-bridge"));
 }
 
 #[test]
-fn log_path_is_per_instance_in_temp() {
-    let (a, b) = (log_path(101), log_path(202));
-    assert_ne!(a, b);
-    assert!(a.file_name().unwrap().to_string_lossy().contains("101"));
-    assert_eq!(a.parent().unwrap(), std::env::temp_dir().as_path());
+fn env_values_skip_comments_blanks_and_quotes() {
+    let env = "# BRIDGE_USER_ID=1\nBRIDGE_BOT_TOKEN=\nBRIDGE_USER_ID= \"42\" \n";
+    assert_eq!(env_value(env, "BRIDGE_BOT_TOKEN"), None, "an empty token means not set up");
+    assert_eq!(env_value(env, "BRIDGE_USER_ID").as_deref(), Some("42"));
+    assert_eq!(env_value(env, "MISSING"), None);
 }
 
 #[test]
-fn port_comes_from_the_config_or_defaults() {
-    let d = std::env::temp_dir().join(format!("claude-auto-rs-w4-port-{}", crate::log::new_run_id()));
-    std::fs::create_dir_all(d.join("claude-remote")).unwrap();
-    assert_eq!(companion_port(Some(&d)), 8791);
-    std::fs::write(d.join("claude-remote").join("config.json"), r#"{"port": 9001}"#).unwrap();
-    assert_eq!(companion_port(Some(&d)), 9001);
-    std::fs::write(d.join("claude-remote").join("config.json"), "{not json").unwrap();
-    assert_eq!(companion_port(Some(&d)), 8791);
+fn the_port_comes_from_the_env_file_or_the_bridge_default() {
+    assert_eq!(bridge_port("BRIDGE_PORT=8792\n"), 8792);
+    assert_eq!(bridge_port("# BRIDGE_PORT=8792\n"), 8787, "a commented line is not a setting");
+    assert_eq!(bridge_port("BRIDGE_PORT=nope\n"), 8787);
+    assert_eq!(bridge_port("BRIDGE_PORT=0\n"), 8787);
+}
+
+#[test]
+fn a_bridge_without_a_token_is_ready_it_runs_as_the_app() {
+    let d = temp_dir("ready");
+    assert!(not_ready(&d).unwrap().contains("no bridge checkout"));
+    std::fs::write(d.join("package.json"), "{}").unwrap();
+    assert!(not_ready(&d).unwrap().contains("npm install"));
+    std::fs::create_dir(d.join("node_modules")).unwrap();
+    assert_eq!(not_ready(&d), None, "no .env at all still starts: no token means app mode");
     std::fs::remove_dir_all(&d).unwrap();
-    assert_eq!(companion_port(None), 8791);
-}
-
-#[test]
-fn tailnet_takes_the_first_100_address() {
-    assert_eq!(
-        tailnet(&[[127, 0, 0, 1], [100, 64, 1, 2], [100, 9, 9, 9]]).as_deref(),
-        Some("100.64.1.2")
-    );
-    assert_eq!(tailnet(&[[192, 168, 1, 2]]), None);
 }
 
 #[test]
 fn a_stale_dist_is_rebuilt_and_a_fresh_one_is_not() {
-    let d = std::env::temp_dir().join(format!("claude-auto-rs-w4-dist-{}", crate::log::new_run_id()));
+    let d = temp_dir("dist");
     std::fs::create_dir_all(d.join("src").join("lib")).unwrap();
     std::fs::create_dir_all(d.join("dist")).unwrap();
     std::fs::write(d.join("package.json"), r#"{"scripts":{"build":"tsc"}}"#).unwrap();
@@ -166,21 +171,25 @@ fn a_stale_dist_is_rebuilt_and_a_fresh_one_is_not() {
         .set_modified(later + Duration::from_secs(60))
         .unwrap();
     assert!(dist_stale(&d), "a nested source newer than dist makes it stale");
-    assert!(has_build_script(&d).unwrap());
+    assert!(has_build_script(&d));
     std::fs::remove_dir_all(&d).unwrap();
 }
 
 #[test]
-fn the_server_build_gets_the_sessions_environment() {
-    let d = std::env::temp_dir().join(format!("claude-auto-rs-npm-{}", crate::log::new_run_id()));
-    std::fs::create_dir_all(&d).unwrap();
-    let npm = d.join("npm.cmd");
-    std::fs::write(&npm, "@echo cfg=%CLAUDE_CONFIG_DIR% args=%*\r\n").unwrap();
+fn a_failed_build_keeps_the_previous_dist_but_not_nothing() {
+    let d = temp_dir("failed");
+    std::fs::write(d.join("package.json"), "{}").unwrap();
     let log = d.join("build.log");
-    let mut child = ChildEnv::default();
-    child.set("CLAUDE_CONFIG_DIR", r"C:\fixture-account");
-    assert!(run_build(&npm, &d, &log, &child).unwrap(), "the fake npm exits 0");
-    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(prepare_dist(&d, &log).is_err(), "no build script and no dist: nothing to run");
+    std::fs::create_dir(d.join("dist")).unwrap();
+    std::fs::write(d.join("dist").join("index.js"), "x").unwrap();
+    File::options()
+        .write(true)
+        .open(d.join("package.json"))
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
+    assert!(dist_stale(&d));
+    assert!(prepare_dist(&d, &log).is_ok(), "an old bridge beats no bridge");
     std::fs::remove_dir_all(&d).unwrap();
-    assert_eq!(text.trim(), r"cfg=C:\fixture-account args=run build --silent", "{text}");
 }

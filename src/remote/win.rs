@@ -1,12 +1,11 @@
-//! Win32 for the companion path: who listens on a TCP port (IPv4 and IPv6), a process's command
-//! line, stopping a process, and this machine's IPv4 addresses.
-#![expect(unsafe_code, reason = "IP Helper, ntdll and process FFI")]
+//! Win32 for the bridge path: who listens on a TCP port (IPv4 and IPv6) and a process's command line.
+#![expect(unsafe_code, reason = "ntdll and process FFI")]
 
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, TerminateProcess};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-use crate::sys::{Family, IpTable, sized_table, tcp_listeners, u32_at};
+use crate::sys::{Family, tcp_listeners};
 
 struct Owned(HANDLE);
 
@@ -64,33 +63,6 @@ pub(crate) fn command_line(pid: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&text))
 }
 
-/// `Stop-Process -Force`.
-pub(crate) fn terminate(pid: u32) -> Result<(), String> {
-    // SAFETY: plain call; a null handle is checked below.
-    let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if h.is_null() {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    let h = Owned(h);
-    // SAFETY: a handle opened with PROCESS_TERMINATE.
-    if unsafe { TerminateProcess(h.0, 1) } == 0 {
-        return Err(std::io::Error::last_os_error().to_string());
-    }
-    Ok(())
-}
-
-/// Every IPv4 address of this machine, in table order.
-pub(crate) fn ipv4_addresses() -> Vec<[u8; 4]> {
-    let Some(b) = sized_table(IpTable::Ipv4Addresses) else {
-        return Vec::new();
-    };
-    let n = u32_at(&b, 0).unwrap_or(0) as usize;
-    // MIB_IPADDRROW is 24 bytes; dwAddr first, in network order, so its bytes read a.b.c.d.
-    (0..n)
-        .filter_map(|i| b.get(4 + i * 24..8 + i * 24).and_then(|s| s.try_into().ok()))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,15 +85,5 @@ mod tests {
         let stem = exe.file_stem().unwrap().to_string_lossy().into_owned();
         assert!(command_line(std::process::id()).unwrap().contains(&stem));
         assert_eq!(command_line(u32::MAX - 3), None);
-    }
-
-    #[test]
-    fn loopback_is_among_the_ipv4_addresses() {
-        assert!(ipv4_addresses().contains(&[127, 0, 0, 1]));
-    }
-
-    #[test]
-    fn terminating_a_missing_pid_is_an_error_not_a_panic() {
-        assert!(terminate(u32::MAX - 3).is_err());
     }
 }

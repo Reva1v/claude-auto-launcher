@@ -12,11 +12,7 @@ pub struct LaunchMode {
     pub flag: &'static str,
     pub attaches_newest: bool,
     pub picks_session: bool,
-    /// Why the mode cannot launch through crc; empty when it can.
-    pub remote_off: &'static str,
 }
-
-const CANNOT_ATTACH: &str = "crc births a new session, it cannot attach to an existing one";
 
 pub const LAUNCH_MODES: [LaunchMode; 4] = [
     LaunchMode {
@@ -25,7 +21,6 @@ pub const LAUNCH_MODES: [LaunchMode; 4] = [
         flag: "",
         attaches_newest: false,
         picks_session: false,
-        remote_off: "",
     },
     LaunchMode {
         name: "continue",
@@ -33,7 +28,6 @@ pub const LAUNCH_MODES: [LaunchMode; 4] = [
         flag: "-c",
         attaches_newest: true,
         picks_session: false,
-        remote_off: CANNOT_ATTACH,
     },
     LaunchMode {
         name: "resume",
@@ -41,7 +35,6 @@ pub const LAUNCH_MODES: [LaunchMode; 4] = [
         flag: "--resume",
         attaches_newest: false,
         picks_session: true,
-        remote_off: CANNOT_ATTACH,
     },
     LaunchMode {
         name: "worktree",
@@ -49,7 +42,6 @@ pub const LAUNCH_MODES: [LaunchMode; 4] = [
         flag: "-w",
         attaches_newest: false,
         picks_session: false,
-        remote_off: "a worktree launch is not routed through crc (unverified interaction)",
     },
 ];
 

@@ -219,8 +219,7 @@ exit 1 ran out of keys before a launch or a quit.
 | `CLAUDE_AUTO_PROJECTS_ROOT` | the projects directory the project screen and the picker read, instead of `~/.claude/projects` (a test seam) |
 | `CLAUDE_AUTO_RATE_LIMITS_DIR` | where the usage records are read, instead of `~/.claude/rate-limits` (a test seam) |
 | `CLAUDE_AUTO_DEBUG=1` | debug mode, see below. `footer` adds a timing line under the screen |
-| `CLAUDE_NO_ROAM=1` | never routes a session through the companion server, even with `remote: true` |
-| `CLAUDE_REMOTE_ROOT` | path to the (unpublished) `remote-control-claude-code` checkout |
+| `CLAUDE_BRIDGE_ROOT` | path to the `claude-tg-bridge` checkout the `remote` row switches |
 | `CLAUDE_AUTO_MIRROR_EXCLUDE`, `CLAUDE_AUTO_MIRROR_SECRETS=0` | the MCP mirror's exclude list and credential opt-out (see [Multi-account sharing](#multi-account-sharing)) |
 | `NO_COLOR`, `TERM=dumb` | disable colour output |
 
@@ -275,7 +274,7 @@ two-account starting point.
 |---|---|---|---|
 | `accounts[]` | `{key, root, label, tint, hidden, archived}` | one `work` account | key 1-8 chars, unique (a shared first letter is fine: the no-UI prompt advertises the shortest unique prefix). root absolute, exactly one must resolve to `~/.claude` (the canonical account). tint one of Green/Magenta/Cyan/Blue/Yellow/Red. hidden omits it from the tab strip and the no-UI prompt's text, though it stays typeable there. archived makes the launcher ignore it entirely (no tab, no prompt entry, no relink or junction, no limits, not restored from prefs) and is refused with a warning on the canonical account, while its key still counts for uniqueness. Breaking any one of these rules discards the WHOLE roster: the warning names the culprit and its value, and every account falls back to the single default `work` account |
 | `sharing` | bool | `false` | forced off with fewer than two accounts. Read [Multi-account sharing](#multi-account-sharing) before turning it on |
-| `remote` | bool | `false` | **the companion it needs is not published**: `crc.cmd` on PATH plus a `remote-control-claude-code` checkout (`CLAUDE_REMOTE_ROOT`). Leave it off unless you have written your own. Adds a Remote row to the launch screen and a second prompt in the no-UI fallback |
+| `remote` | bool | `false` | adds a Remote row: `on` starts [claude-tg-bridge](https://github.com/Shura4eburek/claude-tg-bridge) if it is not running, `off` stops it. The bridge serves every live session, so the row is not per session. Needs a built checkout (`CLAUDE_BRIDGE_ROOT`); without a bot token the bridge runs as an app only |
 | `riderMcp` | `auto`\|`on`\|`off` | `auto` | `auto` scans for Rider's MCP port only while Rider is running |
 | `extraMcpConfigs[]` | paths | `["~/.claude/mcp-shared.json"]` | must be absolute. A relative entry is skipped with a warning |
 | `secretsRoot` | path | `~/.claude-secrets` | must be absolute. See [Secrets](#secrets) |
@@ -334,8 +333,7 @@ needed.
 - `%TEMP%\claude-mcp-rider-<pid>.json` - per-launch Rider MCP config, swept after a day.
 - `%TEMP%\claude-auto-projects-preview-<pid>.json` - the project cache of a preview run, swept after a day.
 - `%TEMP%\claude-rider-mcp-port.txt` - cached Rider MCP port, so most launches skip the port scan.
-- `%TEMP%\claude-remote-server-<pid>.log` (plus `.err`, `.build`) - the companion server's output,
-  one set per launcher that started it (`remote: true` only), not swept.
+- `%TEMP%\claude-tg-bridge.log` and `claude-tg-bridge.build.log` - the output of the bridge this launcher started (`remote: true` only), overwritten on each start.
 - `<file>.pre-relink` and its dated copies beside a shared file a sharing repair replaced.
 
 The launch screen's usage bars need a `~/.claude/rate-limits/<key>.json` writer

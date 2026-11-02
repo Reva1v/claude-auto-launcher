@@ -170,7 +170,7 @@ impl Roster {
             acct.values = visible;
         }
         if remote {
-            rows.insert(1, RowDef::plain(RowName::Remote, "remote", &["on", "off", "on+QR", "stop server"]));
+            rows.insert(1, RowDef::plain(RowName::Remote, "remote", &["on", "off"]));
         }
         // (local) The action sits on this screen: account, remote, action, then the habit rows.
         // Never remembered: an action describes one launch, not a habit (not in PROFILE_FIELDS).

@@ -1,6 +1,6 @@
-//! The remote/companion path (`Remote.ps1` and the crc branch of `claude-auto.ps1`): the
-//! companion server the phone talks to, started on demand and stopped only when it is provably
-//! ours; the tailnet line; the pairing QR; the session born through `crc.cmd`.
+//! (local) The `remote` row: claude-tg-bridge, started on demand and stopped only when it is
+//! provably ours. The bridge attaches to every live `claude` by itself, so a session is launched
+//! the same way with the row on or off.
 
 mod win;
 
@@ -13,93 +13,46 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use crate::out::{self, Fg};
-use crate::types::ChildEnv;
 
-/// What the crc branch launches.
-#[derive(Debug, Clone)]
-pub struct CrcLaunch<'a> {
-    pub argv: &'a [String],
-    pub account: &'a str,
-    pub show_qr: bool,
-    pub child: &'a ChildEnv,
-}
-
-const DEFAULT_PORT: u16 = 8791;
-
-/// Why the companion server could not be built or started.
-#[derive(Debug)]
-enum ServerError {
-    NotOnPath(&'static str),
-    Io(std::io::Error),
-    Json(serde_json::Error),
-}
-
-impl std::fmt::Display for ServerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotOnPath(tool) => write!(f, "{tool} is not on PATH"),
-            Self::Io(e) => e.fmt(f),
-            Self::Json(e) => e.fmt(f),
-        }
-    }
-}
-
-impl std::error::Error for ServerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::NotOnPath(_) => None,
-            Self::Io(e) => Some(e),
-            Self::Json(e) => Some(e),
-        }
-    }
-}
-
-impl From<std::io::Error> for ServerError {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-impl From<serde_json::Error> for ServerError {
-    fn from(e: serde_json::Error) -> Self {
-        Self::Json(e)
-    }
-}
+/// The bridge's own default for `BRIDGE_PORT`.
+const DEFAULT_PORT: u16 = 8787;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
-/// `Get-CompanionPort`: `port` of `%APPDATA%\claude-remote\config.json`, else 8791.
-fn companion_port(appdata: Option<&Path>) -> u16 {
-    appdata
-        .map(|a| a.join("claude-remote").join("config.json"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str::<Value>(t.trim_start_matches('\u{feff}')).ok())
-        .and_then(|v| {
-            let p = v.get("port")?;
-            p.as_u64().or_else(|| p.as_str().and_then(|s| s.trim().parse().ok()))
-        })
-        .and_then(|p| u16::try_from(p).ok())
+/// A value of the bridge's `.env`; blank counts as missing.
+fn env_value(text: &str, key: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        let (k, v) = line.trim().split_once('=')?;
+        (k.trim() == key)
+            .then(|| v.trim().trim_matches(['"', '\'']).to_owned())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+fn bridge_port(env: &str) -> u16 {
+    env_value(env, "BRIDGE_PORT")
+        .and_then(|p| p.parse().ok())
         .filter(|p| *p != 0)
         .unwrap_or(DEFAULT_PORT)
 }
 
-fn live_port() -> u16 {
-    companion_port(std::env::var_os("APPDATA").map(PathBuf::from).as_deref())
-}
-
-/// `Get-CompanionRoot`: `CLAUDE_REMOTE_ROOT` when set, else the documented checkout.
-fn companion_root(env_root: Option<&str>, home: &Path) -> PathBuf {
+/// `CLAUDE_BRIDGE_ROOT` (the shims set it) when set, else a checkout in the home directory.
+fn bridge_root(env_root: Option<&str>, home: &Path) -> PathBuf {
     match env_root.filter(|r| !r.is_empty()) {
         Some(r) => PathBuf::from(r),
-        None => home.join("Desktop").join("Projects").join("remote-control-claude-code"),
+        None => home.join("claude-tg-bridge"),
     }
 }
 
 fn live_root() -> PathBuf {
-    companion_root(
-        std::env::var("CLAUDE_REMOTE_ROOT").ok().as_deref(),
+    bridge_root(
+        std::env::var("CLAUDE_BRIDGE_ROOT").ok().as_deref(),
         &crate::config::PathCtx::from_env().home,
     )
+}
+
+fn read_env(root: &Path) -> String {
+    std::fs::read_to_string(root.join(".env")).unwrap_or_default()
 }
 
 /// A process as the stop guard sees it.
@@ -110,14 +63,15 @@ struct ProcInfo {
     command_line: String,
 }
 
-/// `Test-CompanionProcess`: node, running out of the configured checkout. The port alone says
-/// nothing about identity, and neither does "some node process".
-fn is_companion(info: &ProcInfo, root: &str) -> bool {
-    if !info.name.eq_ignore_ascii_case("node") || info.command_line.is_empty() {
+/// Node running this checkout's `dist`. The port alone says nothing about identity: here 8787 is
+/// often someone else's proxy.
+fn is_bridge(info: &ProcInfo, root: &Path) -> bool {
+    if !info.name.eq_ignore_ascii_case("node") {
         return false;
     }
-    let needle = root.replace('\\', "/").trim_end_matches('/').to_lowercase();
-    !needle.is_empty() && info.command_line.replace('\\', "/").to_lowercase().contains(&needle)
+    let root = root.to_string_lossy().replace('\\', "/");
+    let needle = format!("{}/dist/", root.trim_end_matches('/')).to_lowercase();
+    root.len() > 1 && info.command_line.replace('\\', "/").to_lowercase().contains(&needle)
 }
 
 /// The process seams of the stop path, so tests never find or stop a real process.
@@ -149,47 +103,42 @@ impl Procs for LiveProcs {
         })
     }
 
+    /// The whole tree: the bridge owns its `cloudflared`, which would outlive a lone kill and keep
+    /// the old tunnel up.
     fn stop(&mut self, pid: u32) -> Result<(), String> {
-        win::terminate(pid)
+        let done = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if done.success() {
+            Ok(())
+        } else {
+            Err(format!("taskkill exited with {done}"))
+        }
     }
 }
 
-/// `Stop-CompanionServer`: identify the listener first; anything that is not ours is named and
-/// left running. Always a status line, never a failure: this runs while the launcher quits.
-fn stop_with(root: &Path, port: u16, procs: &mut dyn Procs) -> String {
-    let Some(pid) = procs.listener(port) else {
-        return format!("nothing listening on {port}");
-    };
-    // A listen entry can outlive its pid for a moment: already gone, not a failure.
-    let Some(info) = procs.info(pid) else {
-        return format!("nothing listening on {port} (stale socket entry for pid {pid})");
-    };
-    if !is_companion(&info, &root.to_string_lossy()) {
-        return format!(
-            "port {port} is held by {} (pid {pid}), which is not the companion server - left alone",
-            info.name
-        );
+/// A status line only when something happened: `off` is remembered, and an idle launch stays quiet.
+fn stop_with(root: &Path, port: u16, procs: &mut dyn Procs) -> Option<String> {
+    let pid = procs.listener(port)?;
+    let info = procs.info(pid)?;
+    if !is_bridge(&info, root) {
+        return None;
     }
-    match procs.stop(pid) {
-        Ok(()) => format!("stopped pid {pid} on port {port}"),
-        Err(e) => format!("failed to stop pid {pid}: {e}"),
-    }
+    Some(match procs.stop(pid) {
+        Ok(()) => format!("bridge stopped (pid {pid})"),
+        Err(e) => format!("failed to stop the bridge (pid {pid}): {e}"),
+    })
 }
 
-/// `Stop-CompanionServer` on the live machine; `Ok` carries the status line in every case.
-pub fn stop_companion_server() -> Result<String, String> {
-    Ok(stop_with(&live_root(), live_port(), &mut LiveProcs))
-}
-
-/// `Get-CompanionLogPath`: one log per launcher instance; `.err` and `.build` share its name.
-fn log_path(pid: u32) -> PathBuf {
-    std::env::temp_dir().join(format!("claude-remote-server-{pid}.log"))
-}
-
-fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
-    let mut s = p.as_os_str().to_owned();
-    s.push(suffix);
-    PathBuf::from(s)
+/// The `off` value: stops this checkout's bridge if it is running.
+pub fn stop_bridge() -> Option<String> {
+    let root = live_root();
+    stop_with(&root, bridge_port(&read_env(&root)), &mut LiveProcs)
 }
 
 fn on_path(name: &str) -> Option<PathBuf> {
@@ -219,32 +168,33 @@ fn newest_ts(dir: &Path) -> Option<SystemTime> {
 }
 
 /// `dist/index.js` is missing or older than any source or config file.
-fn dist_stale(server: &Path) -> bool {
-    let mut newest = newest_ts(&server.join("src"));
+fn dist_stale(root: &Path) -> bool {
+    let mut newest = newest_ts(&root.join("src"));
     for extra in ["package.json", "tsconfig.json", "tsconfig.build.json"] {
-        newest = newest.max(mtime(&server.join(extra)));
+        newest = newest.max(mtime(&root.join(extra)));
     }
-    match mtime(&server.join("dist").join("index.js")) {
+    match mtime(&root.join("dist").join("index.js")) {
         None => true,
         Some(d) => newest.is_some_and(|n| d < n),
     }
 }
 
-fn has_build_script(server: &Path) -> Result<bool, ServerError> {
-    let text = std::fs::read_to_string(server.join("package.json"))?;
-    let pkg: Value = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
-    Ok(pkg.pointer("/scripts/build").and_then(Value::as_str).is_some_and(|s| !s.is_empty()))
+fn has_build_script(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(t.trim_start_matches('\u{feff}')).ok())
+        .and_then(|pkg| pkg.pointer("/scripts/build").and_then(Value::as_str).map(|s| !s.is_empty()))
+        .unwrap_or(false)
 }
 
-/// `npm run build` in `server` with the session's environment, its output in `build_log`.
-fn run_build(npm: &Path, server: &Path, build_log: &Path, child: &ChildEnv) -> Result<bool, ServerError> {
+/// `npm run build` in `root`, its output in `build_log`. Not the session's environment: the bridge
+/// outlives this launch and must not inherit one project's secrets.
+fn run_build(npm: &Path, root: &Path, build_log: &Path) -> Result<bool, std::io::Error> {
     let f = File::create(build_log)?;
     let f2 = f.try_clone()?;
-    let mut build = Command::new(npm);
-    child.apply(&mut build);
-    Ok(build
+    Ok(Command::new(npm)
         .args(["run", "build", "--silent"])
-        .current_dir(server)
+        .current_dir(root)
         .stdin(Stdio::null())
         .stdout(f)
         .stderr(f2)
@@ -252,153 +202,89 @@ fn run_build(npm: &Path, server: &Path, build_log: &Path, child: &ChildEnv) -> R
         .success())
 }
 
-/// `dist` when the production build is current or rebuilds cleanly, `tsx` otherwise: a broken
-/// build must never leave the phone without a server.
-fn server_mode(server: &Path, log: &Path, child: &ChildEnv) -> &'static str {
-    let attempt = || -> Result<&'static str, ServerError> {
-        if !has_build_script(server)? {
-            return Ok("tsx");
+/// Rebuilds a stale `dist`. A failed build keeps an existing `dist` running: an old bridge beats no
+/// bridge. `Err` only when there is nothing to run.
+fn prepare_dist(root: &Path, build_log: &Path) -> Result<(), String> {
+    let built = root.join("dist").join("index.js");
+    if !dist_stale(root) {
+        return Ok(());
+    }
+    let failure = if has_build_script(root) {
+        let npm = on_path("npm").ok_or("npm is not on PATH")?;
+        match run_build(&npm, root, build_log) {
+            Ok(true) => return Ok(()),
+            Ok(false) => format!("build failed, see {}", build_log.display()),
+            Err(e) => format!("build could not run: {e}"),
         }
-        if !dist_stale(server) {
-            return Ok("dist");
-        }
-        let build_log = with_suffix(log, ".build");
-        let npm = on_path("npm").ok_or(ServerError::NotOnPath("npm"))?;
-        let ok = run_build(&npm, server, &build_log, child)?;
-        if ok && server.join("dist").join("index.js").exists() {
-            return Ok("dist");
-        }
-        out::line(
-            &format!("  server build failed - falling back to tsx (see {})", build_log.display()),
-            Fg::DarkYellow,
-        );
-        Ok("tsx")
+    } else {
+        "no build script in package.json".to_owned()
     };
-    attempt().unwrap_or_else(|e| {
-        out::line(&format!("  build check failed - falling back to tsx: {e}"), Fg::DarkYellow);
-        "tsx"
-    })
+    if built.exists() {
+        out::line(&format!("  remote: {failure}; starting the previous build"), Fg::DarkYellow);
+        Ok(())
+    } else {
+        Err(failure)
+    }
 }
 
-/// `Start-CompanionServer`: reports what actually happened, not what was intended. `Err` when
-/// node itself could not be started.
-fn start_companion_server(root: &Path, port: u16, log: &Path, child: &ChildEnv) -> Result<String, ServerError> {
-    let server = root.join("server");
-    if !server.join("package.json").exists() {
-        return Ok(format!("no checkout at {}", root.display()));
+/// `None` when the bridge can be started; otherwise why it cannot, with the next step.
+fn not_ready(root: &Path) -> Option<String> {
+    if !root.join("package.json").exists() {
+        return Some(format!("no bridge checkout at {}", root.display()));
     }
-    if win::listener_pid(port).is_some() {
-        return Ok(format!("already listening on {port}"));
+    if !root.join("node_modules").exists() {
+        return Some(format!("bridge is not set up: run npm install in {}", root.display()));
     }
-    let mode = server_mode(&server, log, child);
-    let args: &[&str] = if mode == "dist" {
-        &["dist/index.js"]
-    } else {
-        &["--import", "tsx", "src/index.ts"]
-    };
-    let node = on_path("node").ok_or(ServerError::NotOnPath("node"))?;
-    let stdout = File::create(log)?;
-    let stderr = File::create(with_suffix(log, ".err"))?;
-    // Detached and windowless: the server outlives this launcher and never sees its Ctrl+C.
-    let mut server_cmd = Command::new(node);
-    child.apply(&mut server_cmd);
-    server_cmd
-        .args(args)
-        .current_dir(&server)
+    None
+}
+
+/// The `on` value: starts the bridge unless it already runs. Silent when there is nothing to report;
+/// never a failure: a session must start either way.
+pub fn ensure_bridge() -> Option<String> {
+    let root = live_root();
+    if let Some(reason) = not_ready(&root) {
+        return Some(reason);
+    }
+    let port = bridge_port(&read_env(&root));
+    let mut procs = LiveProcs;
+    if let Some(pid) = procs.listener(port) {
+        return match procs.info(pid) {
+            Some(info) if !is_bridge(&info, &root) => Some(format!(
+                "port {port} is held by {} (pid {pid}): set BRIDGE_PORT in {}",
+                info.name,
+                root.join(".env").display()
+            )),
+            _ => None,
+        };
+    }
+    Some(start_bridge(&root, port).unwrap_or_else(|e| format!("bridge not started: {e}")))
+}
+
+fn start_bridge(root: &Path, port: u16) -> Result<String, String> {
+    let log = std::env::temp_dir().join("claude-tg-bridge.log");
+    prepare_dist(root, &std::env::temp_dir().join("claude-tg-bridge.build.log"))?;
+    let node = on_path("node").ok_or("node is not on PATH")?;
+    let stdout = File::create(&log).map_err(|e| e.to_string())?;
+    let stderr = stdout.try_clone().map_err(|e| e.to_string())?;
+    // Detached and windowless: the bridge outlives this launcher and never sees its Ctrl+C. An
+    // absolute script path, because the stop guard identifies the bridge by its command line.
+    Command::new(node)
+        .arg(root.join("dist").join("index.js"))
+        .current_dir(root)
+        .env("BRIDGE_EXIT_ON_PORT_BUSY", "1")
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
-        .spawn()?;
+        .spawn()
+        .map_err(|e| e.to_string())?;
     for _ in 0..24 {
         std::thread::sleep(Duration::from_millis(250));
         if win::listener_pid(port).is_some() {
-            return Ok(format!("started on {port} ({mode})"));
+            return Ok(format!("bridge started on port {port}"));
         }
     }
-    Ok(format!("did not come up within 6s - see {}", log.display()))
-}
-
-/// `Show-PairingQr`: `npm run pair` prints the code; only a code that verified gets the pause.
-fn show_pairing_qr(root: &Path, child: &ChildEnv) {
-    let run = on_path("npm").ok_or(ServerError::NotOnPath("npm")).and_then(|npm| {
-        let mut pair = Command::new(npm);
-        child.apply(&mut pair);
-        Ok(pair.args(["run", "pair", "--silent"]).current_dir(root.join("server")).status()?)
-    });
-    match run {
-        Ok(s) if s.success() => {
-            out::inline("Scan it, then press Enter to start Claude : ", Fg::Cyan);
-            out::flush();
-            let mut line = String::new();
-            drop(std::io::stdin().read_line(&mut line));
-        }
-        Ok(_) => out::line("  no QR printed (see the message above); starting Claude anyway", Fg::DarkYellow),
-        Err(e) => out::line(&format!("  QR not shown: {e}"), Fg::DarkYellow),
-    }
-}
-
-/// The first tailnet (100.x) IPv4 address.
-fn tailnet(addrs: &[[u8; 4]]) -> Option<String> {
-    addrs
-        .iter()
-        .find(|a| a[0] == 100)
-        .map(|a| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]))
-}
-
-/// `Get-Command crc.cmd`: the `.cmd` shim on PATH, never `crc.ps1` (PowerShell drops `--`).
-/// Public so `app.rs` can write the `decision` record (`via = crc`, `exe`) before the launch.
-pub fn crc_path() -> Option<PathBuf> {
-    crate::invocation::find_on_path("crc", &std::env::var("PATH").unwrap_or_default(), ".CMD")
-}
-
-/// The crc branch: companion server, tailnet address, pairing QR, then `crc.cmd -- argv` (the
-/// `.cmd` shim, so `--` survives). `None` = crc is not on PATH (the caller prints that line and
-/// falls back to plain claude); `Some(code)` = crc ran and exited with `code`.
-pub fn launch_via_crc(req: &CrcLaunch<'_>) -> Option<i32> {
-    let crc = crc_path()?;
-    out::line(
-        "  roaming window: session will be reachable from the phone (CLAUDE_NO_ROAM=1 to disable)",
-        Fg::DarkGray,
-    );
-    let root = live_root();
-    match start_companion_server(&root, live_port(), &log_path(std::process::id()), req.child) {
-        Ok(state) if state.contains("(dist)") => {
-            out::line(&format!("  companion server: {state} (serves all profiles)"), Fg::DarkGray);
-            print_tailnet();
-        }
-        Ok(state) => {
-            // The tsx fallback is pre-multi-profile code: it serves only the profile it inherits.
-            out::line(
-                &format!("  companion server: {state} (serving the {} profile)", req.account),
-                Fg::DarkGray,
-            );
-            print_tailnet();
-        }
-        Err(e) => out::line(&format!("  companion server not started: {e}"), Fg::DarkYellow),
-    }
-    if req.show_qr {
-        show_pairing_qr(&root, req.child);
-    }
-    let mut argv = vec!["--".to_owned()];
-    argv.extend(req.argv.iter().cloned());
-    match crate::invocation::run_child(&crc, &argv, req.child, None) {
-        Ok(code) => Some(code),
-        Err(e) => {
-            out::line(&format!("  crc could not be started: {e}"), Fg::Red);
-            Some(1)
-        }
-    }
-}
-
-fn print_tailnet() {
-    match tailnet(&win::ipv4_addresses()) {
-        Some(ip) => out::line(&format!("  phone over tailscale: http://{ip}:8791"), Fg::DarkGray),
-        None => out::line(
-            "  no tailnet address - the phone can reach this only over USB (adb reverse tcp:8791 tcp:8791)",
-            Fg::DarkYellow,
-        ),
-    }
+    Ok(format!("bridge did not come up within 6s, see {}", log.display()))
 }
 
 #[cfg(test)]

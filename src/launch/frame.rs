@@ -1,4 +1,4 @@
-//! The launch screen's frame (`Get-LaunchFrame`, `Add-LaunchColor`, limit lines). Pure.
+//! The launch screen's frame (`Get-LaunchFrame`, `Add-LaunchColor`). Pure.
 
 use std::sync::LazyLock;
 
@@ -10,8 +10,8 @@ use crate::frame::{
     measure_cell_spans, new_hint_footer, new_radio_row,
 };
 use crate::layout::{display_width, new_box};
-use crate::theme::{self, BarStyle, Glyphs, new_bar};
-use crate::types::{DefaultLabels, LimitRecord, Limits, VersionInfo};
+use crate::theme::{self, Glyphs};
+use crate::types::{DefaultLabels, Limits, VersionInfo};
 
 /// Everything `Get-LaunchFrame` draws from.
 #[derive(Debug, Clone, Copy)]
@@ -27,105 +27,6 @@ pub struct LaunchFrameInput<'a> {
     pub default_advisor_label: &'a str,
     pub default_labels: &'a DefaultLabels,
     pub style: Style,
-}
-
-/// One limit as label and percent, in drawing order: five hour, seven day, model bucket.
-fn limit_items(l: &LimitRecord) -> Vec<(String, i64)> {
-    let mut items = Vec::new();
-    if let Some(p) = l.five_hour {
-        items.push(("5h".to_owned(), p));
-    }
-    if let Some(p) = l.seven_day {
-        items.push(("7d".to_owned(), p));
-    }
-    if let Some(p) = l.model {
-        let label = l
-            .model_label
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| "model".to_owned(), str::to_lowercase);
-        items.push((label, p));
-    }
-    items
-}
-
-const WIDE_BAR: usize = 8;
-/// The narrow tier's bar widths, widest first.
-const NARROW_BARS: [usize; 3] = [8, 6, 4];
-/// The row labels' column: the narrow usage row moves here before it gives up its bars.
-const LABEL_COLUMN: usize = 3;
-const LIMIT_SEP: &str = "   ";
-
-/// The usage row under the account tabs: one fixed-width cell per limit (label padded to the
-/// longest, a bar, the percent right-aligned), the age last. It starts on the value column of the
-/// rows below. The wide tier stacks the cells one per line when they do not fit. The narrow tier
-/// tries narrower bars, then the label column, then drops the bars, then keeps the leading
-/// pieces that fit.
-pub fn limit_lines(l: &LimitRecord, indent: usize, inner: usize, wide: bool, g: &Glyphs) -> Vec<String> {
-    let items = limit_items(l);
-    if items.is_empty() {
-        return Vec::new();
-    }
-    let lw = items.iter().map(|(label, _)| label.chars().count()).max().unwrap_or(0);
-    let cells = |bar: usize| -> Vec<String> {
-        items
-            .iter()
-            .map(|(label, p)| {
-                if bar == 0 {
-                    format!("{label:<lw$} {p:>3}%")
-                } else {
-                    format!("{label:<lw$} {} {p:>3}%", new_bar(*p, bar, g, BarStyle::Blocks))
-                }
-            })
-            .collect()
-    };
-    let age = (!l.age_text.is_empty()).then_some(l.age_text.as_str());
-    let tries: Vec<(usize, usize)> = if wide {
-        vec![(indent, WIDE_BAR)]
-    } else {
-        [indent, LABEL_COLUMN]
-            .iter()
-            .flat_map(|i| NARROW_BARS.iter().map(move |b| (*i, *b)))
-            .chain([(LABEL_COLUMN, 0)])
-            .collect()
-    };
-    for (at, bar) in tries {
-        let mut pieces = cells(bar);
-        pieces.extend(age.map(str::to_owned));
-        let one = format!("{}{}", " ".repeat(at), pieces.join(LIMIT_SEP));
-        if display_width(&one) <= inner {
-            return vec![one];
-        }
-    }
-    if wide {
-        let stacked = cells(WIDE_BAR);
-        let last = stacked.len() - 1;
-        let fits = stacked
-            .iter()
-            .all(|c| indent + display_width(c) + LIMIT_SEP.len() + age.map_or(0, display_width) <= inner);
-        let lead = " ".repeat(if fits { indent } else { LABEL_COLUMN });
-        return stacked
-            .into_iter()
-            .enumerate()
-            .map(|(i, c)| match age.filter(|_| i == last) {
-                Some(a) => format!("{lead}{c}{LIMIT_SEP}{a}"),
-                None => format!("{lead}{c}"),
-            })
-            .collect();
-    }
-    let mut line = " ".repeat(LABEL_COLUMN);
-    for (i, p) in cells(0).into_iter().chain(age.map(str::to_owned)).enumerate() {
-        let next = if i == 0 {
-            format!("{line}{p}")
-        } else {
-            format!("{line}{LIMIT_SEP}{p}")
-        };
-        if display_width(&next) > inner {
-            break;
-        }
-        line = next;
-    }
-    (!line.trim().is_empty()).then_some(line).into_iter().collect()
 }
 
 fn pad_right(s: &str, width: usize) -> String {
@@ -248,11 +149,6 @@ pub fn launch_frame(roster: &Roster, inp: &LaunchFrameInput<'_>) -> Frame {
         }
         hits.push((i, row.name.as_str(), body.len(), cells));
         body.push(line);
-        if row.name == RowName::Account
-            && let Some(l) = limit
-        {
-            body.extend(limit_lines(l, 3 + label_width, inner, wide, &g));
-        }
     }
 
     let head: Vec<String> = if wide {
@@ -420,7 +316,7 @@ pub fn add_launch_color(line: &str, enabled: bool, g: &Glyphs, roster: &Roster) 
         {
             let whole: String = chars.get(i..end).map_or_else(String::new, |c| c.iter().collect());
             let value: String = chars.get(i + 1..end - 1).map_or_else(String::new, |c| c.iter().collect());
-            let tint = if ["off", "stop server", "safe"].iter().any(|v| v.eq_ignore_ascii_case(&value)) {
+            let tint = if ["off", "safe"].iter().any(|v| v.eq_ignore_ascii_case(&value)) {
                 theme::YELLOW
             } else {
                 roster.tint(&value)

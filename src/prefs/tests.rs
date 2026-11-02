@@ -69,7 +69,7 @@ fn save_keeps_other_profiles_and_previous_answer_for_default() {
     let prev =
         parse_prefs(r#"{"Version":2,"Account":"work","Profiles":{"work":{"Model":"fable","Effort":"default"},"low":{"Model":"haiku"}}}"#);
     let mut s = r.new_state();
-    s.remote = "stop server".into();
+    s.remote = "off".into();
     let d = build_prefs_data(&prev, &s, 5, &r);
     assert_eq!(d["Profiles"]["low"]["Model"], "haiku");
     assert_eq!(d["Profiles"]["work"]["Model"], "fable", "default says nothing");
