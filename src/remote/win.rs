@@ -1,9 +1,15 @@
 //! Win32 for the bridge path: who listens on a TCP port (IPv4 and IPv6) and a process's command line.
 #![expect(unsafe_code, reason = "ntdll and process FFI")]
 
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt as _;
+use std::path::PathBuf;
+
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+};
 
 use crate::sys::{Family, tcp_listeners};
 
@@ -24,6 +30,25 @@ fn listener_in(family: Family, port: u16) -> Option<u32> {
 /// address of either family (node listens on `::` by default).
 pub(crate) fn listener_pid(port: u16) -> Option<u32> {
     listener_in(Family::V4, port).or_else(|| listener_in(Family::V6, port))
+}
+
+/// Полный путь исполняемого файла процесса, `None`, когда его не открыть или не прочитать.
+pub(crate) fn image_path(pid: u32) -> Option<PathBuf> {
+    // SAFETY: plain call; a null handle is checked below.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        return None;
+    }
+    let h = Owned(h);
+    // Предел длинного пути Windows: короткий буфер дал бы `None` и `off` не тронул бы настоящий мост.
+    let mut buf = vec![0u16; 32_768];
+    let mut len = u32::try_from(buf.len()).ok()?;
+    // SAFETY: `buf` holds `len` writable u16; the call writes at most that and updates `len`.
+    let ok = unsafe { QueryFullProcessImageNameW(h.0, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &raw mut len) };
+    if ok == 0 {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(buf.get(..len as usize)?)))
 }
 
 /// A process's command line, `None` when it cannot be opened or read.
@@ -77,6 +102,46 @@ mod tests {
         assert_eq!(listener_pid(p6), Some(std::process::id()));
         drop((v4, v6));
         assert_eq!(listener_pid(p4), None, "a closed port has no listener");
+    }
+
+    /// Убивает пробу и при упавшей проверке: иначе она пережила бы тест.
+    struct Probe(std::process::Child);
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            drop(self.0.kill());
+            drop(self.0.wait());
+        }
+    }
+
+    #[test]
+    fn the_image_path_is_the_real_file_and_a_dead_pid_has_none() {
+        assert_eq!(image_path(std::process::id()), Some(std::env::current_exe().unwrap()));
+        assert_eq!(image_path(u32::MAX - 3), None);
+    }
+
+    // `claude-bridge setup` переименовывает занятый exe, и `off` обязан найти идущий мост и после
+    // этого. Поэтому настоящий процесс, а не предположение о поведении Windows.
+    #[test]
+    fn the_image_path_of_a_running_process_follows_a_rename() {
+        let dir = std::env::temp_dir().join(format!("claude-auto-rs-image-{}", crate::log::new_run_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let (first, second) = (dir.join("probe.exe"), dir.join("probe.exe.old-0"));
+        std::fs::copy(PathBuf::from(system).join("System32").join("PING.EXE"), &first).unwrap();
+        let probe = Probe(
+            std::process::Command::new(&first)
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = probe.0.id();
+        assert_eq!(image_path(pid), Some(first.clone()));
+        std::fs::rename(&first, &second).unwrap();
+        assert_eq!(image_path(pid), Some(second));
+        drop(probe);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -22,7 +22,10 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// A value of the bridge's `.env`; blank counts as missing.
 fn env_value(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|line| {
-        let (k, v) = line.trim().split_once('=')?;
+        // Блокнот сохраняет `.env` с BOM, а новый мост его понимает: иначе лаунчер искал бы мост на
+        // порту по умолчанию и навязал бы ему этот порт при запуске.
+        let line = line.trim_start_matches('\u{feff}').trim();
+        let (k, v) = line.strip_prefix("export ").unwrap_or(line).split_once('=')?;
         (k.trim() == key)
             .then(|| v.trim().trim_matches(['"', '\'']).to_owned())
             .filter(|v| !v.is_empty())
@@ -44,11 +47,76 @@ fn bridge_root(env_root: Option<&str>, home: &Path) -> PathBuf {
     }
 }
 
-fn live_root() -> PathBuf {
-    bridge_root(
+/// Копия, которую ставит `claude-bridge setup`; путь не берётся из окружения, потому что лаунчер
+/// запускает этот файл и останавливает то, что им считает.
+fn installed_exe(home: &Path) -> PathBuf {
+    home.join(".claude-tg-bridge").join("bin").join("claude-bridge.exe")
+}
+
+/// Какой мост ведёт строка `remote`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Bridge {
+    /// Node из checkout-а: прежнее поведение.
+    Checkout(PathBuf),
+    /// Установленная копия `claude-bridge.exe`.
+    Installed(PathBuf),
+}
+
+/// Только явный `CLAUDE_BRIDGE_RUST=1`, а не наличие файла: копия появляется при `claude-bridge
+/// setup`, задолго до живой проверки, и лаунчер не должен перескочить на неё сам (T042).
+fn choose_bridge(rust: Option<&str>, env_root: Option<&str>, home: &Path) -> Bridge {
+    if rust == Some("1") {
+        Bridge::Installed(installed_exe(home))
+    } else {
+        Bridge::Checkout(bridge_root(env_root, home))
+    }
+}
+
+/// Только сам файл копии или он же, отставленный `claude-bridge setup`. Имя и аргументы не в счёт:
+/// под этим именем ходит сборка из репозитория, а путь в аргументах бывает у кого угодно.
+/// Отставленный считается, потому что путь идущего процесса следует за переименованием, а `setup`
+/// переименовывает занятый exe: без этого `off` терял бы мост после каждой установки.
+fn is_installed_copy(image: &Path, exe: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    let (image, exe) = (norm(image), norm(exe));
+    image == exe
+        || image
+            .strip_prefix(&format!("{exe}.old-"))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn live_bridge() -> Bridge {
+    let home = crate::config::PathCtx::from_env().home;
+    choose_bridge(
+        std::env::var("CLAUDE_BRIDGE_RUST").ok().as_deref(),
         std::env::var("CLAUDE_BRIDGE_ROOT").ok().as_deref(),
-        &crate::config::PathCtx::from_env().home,
+        &home,
     )
+}
+
+impl Bridge {
+    /// Где лежит `.env` этого моста.
+    fn env_dir(&self) -> &Path {
+        match self {
+            Self::Checkout(root) => root,
+            Self::Installed(exe) => exe.parent().unwrap_or(exe),
+        }
+    }
+
+    fn owns(&self, info: &ProcInfo) -> bool {
+        match self {
+            Self::Checkout(root) => is_bridge(info, root),
+            Self::Installed(exe) => info.image.as_deref().is_some_and(|image| is_installed_copy(image, exe)),
+        }
+    }
+
+    /// `None`, когда мост можно запустить; иначе почему нельзя и что сделать.
+    fn missing(&self) -> Option<String> {
+        match self {
+            Self::Checkout(root) => not_ready(root),
+            Self::Installed(exe) => (!exe.is_file()).then(|| format!("no installed bridge at {}: run claude-bridge setup", exe.display())),
+        }
+    }
 }
 
 fn read_env(root: &Path) -> String {
@@ -61,6 +129,8 @@ struct ProcInfo {
     /// Without `.exe`, like `Get-Process`'s `ProcessName`.
     name: String,
     command_line: String,
+    /// Полный путь исполняемого файла; `None`, когда его нельзя прочитать.
+    image: Option<PathBuf>,
 }
 
 /// Node running this checkout's `dist`. The port alone says nothing about identity: here 8787 is
@@ -100,6 +170,7 @@ impl Procs for LiveProcs {
         Some(ProcInfo {
             name,
             command_line: win::command_line(pid).unwrap_or_default(),
+            image: win::image_path(pid),
         })
     }
 
@@ -123,10 +194,10 @@ impl Procs for LiveProcs {
 }
 
 /// A status line only when something happened: `off` is remembered, and an idle launch stays quiet.
-fn stop_with(root: &Path, port: u16, procs: &mut dyn Procs) -> Option<String> {
+fn stop_with(bridge: &Bridge, port: u16, procs: &mut dyn Procs) -> Option<String> {
     let pid = procs.listener(port)?;
     let info = procs.info(pid)?;
-    if !is_bridge(&info, root) {
+    if !bridge.owns(&info) {
         return None;
     }
     Some(match procs.stop(pid) {
@@ -135,10 +206,10 @@ fn stop_with(root: &Path, port: u16, procs: &mut dyn Procs) -> Option<String> {
     })
 }
 
-/// The `off` value: stops this checkout's bridge if it is running.
+/// The `off` value: stops the bridge if it is running.
 pub fn stop_bridge() -> Option<String> {
-    let root = live_root();
-    stop_with(&root, bridge_port(&read_env(&root)), &mut LiveProcs)
+    let bridge = live_bridge();
+    stop_with(&bridge, bridge_port(&read_env(bridge.env_dir())), &mut LiveProcs)
 }
 
 fn on_path(name: &str) -> Option<PathBuf> {
@@ -241,23 +312,29 @@ fn not_ready(root: &Path) -> Option<String> {
 /// The `on` value: starts the bridge unless it already runs. Silent when there is nothing to report;
 /// never a failure: a session must start either way.
 pub fn ensure_bridge() -> Option<String> {
-    let root = live_root();
-    if let Some(reason) = not_ready(&root) {
+    let bridge = live_bridge();
+    let port = bridge_port(&read_env(bridge.env_dir()));
+    ensure_with(&bridge, port, &mut LiveProcs, &mut || match &bridge {
+        Bridge::Checkout(root) => start_bridge(root, port),
+        Bridge::Installed(exe) => start_installed(exe, port),
+    })
+}
+
+fn ensure_with(bridge: &Bridge, port: u16, procs: &mut dyn Procs, start: &mut dyn FnMut() -> Result<String, String>) -> Option<String> {
+    if let Some(reason) = bridge.missing() {
         return Some(reason);
     }
-    let port = bridge_port(&read_env(&root));
-    let mut procs = LiveProcs;
     if let Some(pid) = procs.listener(port) {
         return match procs.info(pid) {
-            Some(info) if !is_bridge(&info, &root) => Some(format!(
+            Some(info) if !bridge.owns(&info) => Some(format!(
                 "port {port} is held by {} (pid {pid}): set BRIDGE_PORT in {}",
                 info.name,
-                root.join(".env").display()
+                bridge.env_dir().join(".env").display()
             )),
             _ => None,
         };
     }
-    Some(start_bridge(&root, port).unwrap_or_else(|e| format!("bridge not started: {e}")))
+    Some(start().unwrap_or_else(|e| format!("bridge not started: {e}")))
 }
 
 fn start_bridge(root: &Path, port: u16) -> Result<String, String> {
@@ -278,13 +355,47 @@ fn start_bridge(root: &Path, port: u16) -> Result<String, String> {
         .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .map_err(|e| e.to_string())?;
+    Ok(wait_for_listener(port, &log))
+}
+
+fn wait_for_listener(port: u16, log: &Path) -> String {
     for _ in 0..24 {
         std::thread::sleep(Duration::from_millis(250));
         if win::listener_pid(port).is_some() {
-            return Ok(format!("bridge started on port {port}"));
+            return format!("bridge started on port {port}");
         }
     }
-    Ok(format!("bridge did not come up within 6s, see {}", log.display()))
+    format!("bridge did not come up within 6s, see {}", log.display())
+}
+
+/// `claude-bridge serve` без вывода: его подключает вызывающий.
+fn serve_command(exe: &Path, port: u16) -> Command {
+    let mut c = Command::new(exe);
+    c.arg("serve")
+        // У моста окружение главнее `.env`: унаследованное значение увело бы его с порта, на котором
+        // лаунчер будет его ждать и останавливать.
+        .env("BRIDGE_PORT", port.to_string())
+        .stdin(Stdio::null())
+        // Как у прежнего моста: переживает лаунчер и не видит его Ctrl+C.
+        .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    // Текущий каталог лаунчера — чужой проект, а мост читает `.env` и оттуда.
+    if let Some(dir) = exe.parent() {
+        c.current_dir(dir);
+    }
+    c
+}
+
+fn start_installed(exe: &Path, port: u16) -> Result<String, String> {
+    // Свой лог: прежний мост может работать рядом, и общий файл обнулился бы при запуске нового.
+    let log = std::env::temp_dir().join("claude-bridge.log");
+    let stdout = File::create(&log).map_err(|e| e.to_string())?;
+    let stderr = stdout.try_clone().map_err(|e| e.to_string())?;
+    serve_command(exe, port)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(wait_for_listener(port, &log))
 }
 
 #[cfg(test)]
