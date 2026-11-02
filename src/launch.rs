@@ -23,6 +23,7 @@ pub use options::{
 pub enum RowName {
     Account,
     Remote,
+    Action,
     Model,
     Effort,
     Advisor,
@@ -35,6 +36,7 @@ impl RowName {
         match self {
             Self::Account => "Account",
             Self::Remote => "Remote",
+            Self::Action => "Action",
             Self::Model => "Model",
             Self::Effort => "Effort",
             Self::Advisor => "Advisor",
@@ -47,6 +49,7 @@ impl RowName {
         [
             Self::Account,
             Self::Remote,
+            Self::Action,
             Self::Model,
             Self::Effort,
             Self::Advisor,
@@ -169,6 +172,12 @@ impl Roster {
         if remote {
             rows.insert(1, RowDef::plain(RowName::Remote, "remote", &["on", "off", "on+QR", "stop server"]));
         }
+        // (local) The action sits on this screen: account, remote, action, then the habit rows.
+        // Never remembered: an action describes one launch, not a habit (not in PROFILE_FIELDS).
+        rows.insert(
+            if remote { 2 } else { 1 },
+            RowDef::plain(RowName::Action, "action", &["new", "project", "continue", "resume", "worktree"]),
+        );
         let tints = accounts.iter().map(|a| (a.key.clone(), a.tint.clone())).collect();
         Self {
             rows,
@@ -284,6 +293,7 @@ impl LaunchState {
         match row {
             RowName::Account => &self.account,
             RowName::Remote => &self.remote,
+            RowName::Action => &self.action,
             RowName::Model => &self.model,
             RowName::Effort => &self.effort,
             RowName::Advisor => &self.advisor,
@@ -296,6 +306,7 @@ impl LaunchState {
         let slot = match row {
             RowName::Account => &mut self.account,
             RowName::Remote => &mut self.remote,
+            RowName::Action => &mut self.action,
             RowName::Model => &mut self.model,
             RowName::Effort => &mut self.effort,
             RowName::Advisor => &mut self.advisor,

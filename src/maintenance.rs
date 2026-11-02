@@ -138,13 +138,24 @@ pub fn update_before_launch(version: &mut VersionInfo) {
     let claude_dir = home.join(".claude");
     let channel = release::auto_updates_channel(&claude_dir.join("settings.json"));
     let cache = claude_dir.join("claude-auto-update.json");
-    let remote = match release::remote_version(&channel, &cache, now_ms(), &mut |url| win::https_get(url, 5000)) {
-        Ok(r) => r,
-        Err(e) => {
-            if let Some(line) = release::skipped_line(&e) {
-                out::line(&line, Fg::DarkYellow);
+    // (local) Stale-while-revalidate: a known version answers at any age and an expired one is
+    // refreshed on a thread that finishes while claude runs, so a terminal opened after a break does
+    // not wait for the network; a release is installed on the launch after the one that learned of it.
+    let remote = if let Some((known, expired)) = release::stale_version(&channel, &cache, now_ms()) {
+        if expired {
+            let (channel, cache) = (channel.clone(), cache.clone());
+            std::thread::spawn(move || release::refresh_version(&channel, &cache, now_ms(), &mut |url| win::https_get(url, 5000)));
+        }
+        Some(known)
+    } else {
+        match release::remote_version(&channel, &cache, now_ms(), &mut |url| win::https_get(url, 5000)) {
+            Ok(r) => r,
+            Err(e) => {
+                if let Some(line) = release::skipped_line(&e) {
+                    out::line(&line, Fg::DarkYellow);
+                }
+                return;
             }
-            return;
         }
     };
     if release::update_available(version.installed.as_deref(), remote.as_deref()) {

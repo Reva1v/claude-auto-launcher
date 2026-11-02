@@ -52,6 +52,8 @@ enum UiEnd {
 struct UiOutcome {
     state: LaunchState,
     resume_id: Option<String>,
+    /// (local) The picked session lives in another account's store: copied before claude starts.
+    transfer: Option<crate::sessions::cross_account::Transfer>,
     fork: bool,
     view: LaunchView,
     restored: Vec<String>,
@@ -279,6 +281,21 @@ fn launch(run: &Run) -> i32 {
         out::line(&format!("  {e}"), Fg::Red);
         return 1;
     }
+    // (local) A cross-account pick: after the preview guard, before claude scans for the id. A failed
+    // copy stops the launch: claude would open on "no such session", which reads like the picker lied.
+    if let Some(t) = ui.as_ref().and_then(|o| o.transfer.as_ref()).filter(|_| !run.preview) {
+        let target = crate::sessions::sessions_root(&run.cfg, &choice);
+        match crate::sessions::cross_account::copy_session_to_profile(&t.source, &target) {
+            Ok(_) => {
+                let short: String = t.session_id.chars().take(8).collect();
+                out::line(&format!("  session {short} copied: {} -> {choice}", t.from_account), Fg::DarkGray);
+            }
+            Err(e) => {
+                out::line(&format!("  session transfer failed, not launching: {e}"), Fg::Red);
+                return 1;
+            }
+        }
+    }
     if let Some(o) = ui.as_ref().filter(|_| !run.preview)
         && !o.state.project.is_empty()
         && !env::set_project_directory(&o.state.project)
@@ -358,6 +375,15 @@ fn launch(run: &Run) -> i32 {
     let argv = invocation::claude_invocation(&launch_argv, &mcp);
 
     if run.preview {
+        if let Some(t) = ui.as_ref().and_then(|o| o.transfer.as_ref()) {
+            out::line(
+                &format!(
+                    "session transfer   : {} from {} -> {choice} (copied on a real launch)",
+                    t.session_id, t.from_account
+                ),
+                Fg::Plain,
+            );
+        }
         preview_summary(&choice, &child, remote_on, show_qr, stop_server, &launch_argv, &claude, &argv);
         return 0;
     }

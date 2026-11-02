@@ -69,7 +69,8 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
             PreviewTerm::new(parse_preview_size(var("CLAUDE_AUTO_PREVIEW_SIZE").as_deref()), keys, false).with_logger(run.logger.clone()),
         )
     } else {
-        let mouse = var("CLAUDE_AUTO_NO_MOUSE").as_deref() != Some("1");
+        // (local) Keyboard only on this machine: CLAUDE_AUTO_MOUSE=1 arms the mouse again.
+        let mouse = var("CLAUDE_AUTO_MOUSE").as_deref() == Some("1") && var("CLAUDE_AUTO_NO_MOUSE").as_deref() != Some("1");
         let trace = (var("CLAUDE_AUTO_INPUT_TRACE").as_deref() == Some("1")).then(|| trace_path(&run.ctx));
         let Some(input) = ConsoleInput::open(mouse, output_redirected, trace) else {
             return Ok(UiEnd::NoConsole);
@@ -86,20 +87,25 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
     tm.end(prefs_span);
     tm.end(load);
     let load = tm.begin(&["load", "project"]);
-    let cache = run.preview.then(|| {
-        let tmp = std::env::temp_dir();
-        projects::remove_stale_preview_cache(&tmp);
-        tmp.join(format!("claude-auto-projects-preview-{}.json", std::process::id()))
-    });
+    let preview = run.preview;
+    if preview {
+        projects::remove_stale_preview_cache(&std::env::temp_dir());
+    }
     let account_roots: Vec<String> = run.cfg.accounts.iter().map(|a| a.root.clone()).collect();
     let roots = projects::launcher_profile_roots(&run.ctx.home, var("CLAUDE_CONFIG_DIR").as_deref(), &account_roots);
-    let project_list = projects::project_registry(cache.as_deref(), &roots);
-    let project_source = projects::set_launch_start_project(&mut state, &run.ctx.cwd, &project_list);
-    let preselect = state.project.clone();
+    // (local) Built beside the launch screen, which shows no project on this machine, and collected
+    // once it is left. The start rule then runs on the account the owner ended on.
+    let registry = std::thread::spawn(move || projects::all_accounts_registry(&account_roots, &roots, preview));
+    let mut registry = Some(registry);
+    let mut project_list: Vec<projects::Project> = Vec::new();
+    let mut project_source = String::new();
+    let mut preselect = String::new();
     tm.end(load);
     let held_dirs: Vec<PathBuf> = run.cfg.accounts.iter().map(|a| Path::new(&a.root).join("sessions")).collect();
     let mut chosen_how: Option<String>;
     let actions = run.cfg.maintenance_actions.clone();
+    // (local) No project screen unless asked: Enter starts where the launcher was opened.
+    let always_project_screen = var("CLAUDE_AUTO_PROJECT_SCREEN").as_deref() == Some("1");
 
     let outcome = loop {
         let mut hook = |k: &KeyPress, t: &mut dyn Term| -> bool {
@@ -117,17 +123,35 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
             break UiEnd::Cancelled;
         };
         state = next;
-        let Some(chosen) = projects::run_project_screen(term.as_mut(), &project_list, &run.ctx.cwd, style)? else {
-            if run.preview {
-                break UiEnd::PreviewPickerCancelled;
-            }
-            continue;
-        };
-        state.project.clone_from(&chosen.path);
-        state.project_slug.clone_from(&chosen.slug);
-        state.project_slugs.clone_from(&chosen.slugs);
-        state.action.clone_from(&chosen.action);
-        chosen_how = Some(chosen.how);
+        if let Some(task) = registry.take() {
+            let wait = tm.begin(&["load", "project"]);
+            project_list = task.join().unwrap_or_default();
+            project_source = projects::set_launch_start_project(&mut state, &run.ctx.cwd, &project_list);
+            preselect.clone_from(&state.project);
+            tm.end(wait);
+        }
+        // (local) The 'project' action opens the project screen for this one launch; Escape from
+        // anything below it brings the launch row back to 'project'.
+        let via_project = state.action == "project";
+        if always_project_screen || via_project {
+            let initial = if via_project { "new" } else { state.action.as_str() };
+            let Some(chosen) = projects::run_project_screen(term.as_mut(), &project_list, &run.ctx.cwd, initial, style)? else {
+                if run.preview {
+                    break UiEnd::PreviewPickerCancelled;
+                }
+                continue;
+            };
+            state.project.clone_from(&chosen.path);
+            state.project_slug.clone_from(&chosen.slug);
+            state.project_slugs.clone_from(&chosen.slugs);
+            state.action.clone_from(&chosen.action);
+            chosen_how = Some(chosen.how);
+        } else {
+            state.project = run.ctx.cwd.to_string_lossy().into_owned();
+            state.project_slugs = projects::slugs_for(&project_list, &run.ctx.cwd);
+            state.project_slug = state.project_slugs.first().cloned().unwrap_or_default();
+            chosen_how = Some("cwd".to_owned());
+        }
         let mode = launch_mode(&state.action);
         let mut slugs: Vec<String> = state.project_slugs.iter().filter(|s| !s.is_empty()).cloned().collect();
         if slugs.is_empty() && !state.project_slug.is_empty() {
@@ -140,22 +164,47 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
                 sessions::continue_session_holder(&held_dirs, &slugs, &sessions_root)
             };
             if confirm_held(term.as_mut(), holder.as_deref(), style)? {
-                break launch_end(state, None, false, view, merged.restored, project_source, preselect, chosen_how);
+                break launch_end(
+                    state,
+                    None,
+                    None,
+                    false,
+                    view,
+                    merged.restored,
+                    project_source,
+                    preselect,
+                    chosen_how,
+                );
             }
             if run.preview {
                 break UiEnd::PreviewHeldBack;
             }
+            if via_project {
+                "project".clone_into(&mut state.action);
+            }
             continue;
         }
         if !mode.is_some_and(|m| m.picks_session) {
-            break launch_end(state, None, false, view, merged.restored, project_source, preselect, chosen_how);
+            break launch_end(
+                state,
+                None,
+                None,
+                false,
+                view,
+                merged.restored,
+                project_source,
+                preselect,
+                chosen_how,
+            );
         }
         let name = Path::new(&state.project)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let others = sessions::other_stores(&run.cfg, &state.account);
         let req = sessions::PickerRequest {
             sessions_root,
+            others: &others,
             project_slugs: &slugs,
             project_name: &name,
             style,
@@ -172,6 +221,7 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
                 break launch_end(
                     state,
                     Some(picked.session_id),
+                    picked.transfer,
                     picked.fork,
                     view,
                     merged.restored,
@@ -183,17 +233,24 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
             if run.preview {
                 break UiEnd::PreviewHeldBack;
             }
+            if via_project {
+                "project".clone_into(&mut state.action);
+            }
             continue;
         }
         if run.preview {
             break UiEnd::PreviewPickerCancelled;
         }
+        if via_project {
+            "project".clone_into(&mut state.action);
+        }
     };
-    if let Some(c) = cache
-        && c.exists()
-        && std::fs::remove_file(&c).is_err()
-    {
-        // A stale per-PID cache is swept by the next preview.
+    if preview && let Some(task) = registry.take() {
+        // Left before the registry was collected: its per-PID preview caches are swept below.
+        drop(task.join());
+    }
+    if preview {
+        projects::remove_own_preview_caches(&std::env::temp_dir());
     }
     Ok(outcome)
 }
@@ -202,6 +259,7 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
 fn launch_end(
     state: LaunchState,
     resume_id: Option<String>,
+    transfer: Option<sessions::cross_account::Transfer>,
     fork: bool,
     view: LaunchView,
     restored: Vec<String>,
@@ -212,6 +270,7 @@ fn launch_end(
     UiEnd::Launch(Box::new(UiOutcome {
         state,
         resume_id,
+        transfer,
         fork,
         view,
         restored,

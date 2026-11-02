@@ -29,9 +29,9 @@ fn args(r: &Roster, f: impl FnOnce(&mut LaunchState)) -> String {
 }
 
 #[test]
-fn row_order_is_account_remote_model_effort_advisor_permission_mode() {
+fn row_order_is_account_remote_action_model_effort_advisor_permission_mode() {
     let names: Vec<&str> = four().rows.iter().map(|r| r.name.as_str()).collect();
-    assert_eq!(names.join(","), "Account,Remote,Model,Effort,Advisor,Permission,Mode");
+    assert_eq!(names.join(","), "Account,Remote,Action,Model,Effort,Advisor,Permission,Mode");
     assert_eq!(
         four().row(RowName::Account).map(|r| r.values.join(",")),
         Some("work,personal,low".into())
@@ -98,7 +98,7 @@ fn default_pins_opus_when_account_lacks_fable() {
 fn step_wraps_and_skips_hidden_fable() {
     let r = four();
     let mut s = r.new_state();
-    s.row = 2;
+    s.row = 3;
     let none: Vec<String> = Vec::new();
     let labels = DefaultLabels::new();
     let ctx = OptionText::plain(Some(&none), &labels);
@@ -119,7 +119,7 @@ fn folded_twin_takes_the_default_slot_and_stepping_onto_it_stores_the_twin() {
         "low medium default xhigh max ultracode"
     );
     let mut s = r.new_state();
-    s.row = 3;
+    s.row = 4;
     s.effort = "medium".into();
     step_launch_value(&r, &mut s, 1, &ctx);
     assert_eq!(s.effort, "high");
@@ -217,4 +217,23 @@ fn model_labels_from_catalog_keep_sonnet_bracketless() {
     let row = r.row(RowName::Model).unwrap();
     assert_eq!(row.labels.get("opus1m").map(String::as_str), Some("Opus 6[1M]"));
     assert_eq!(row.labels.get("sonnet1m").map(String::as_str), Some("Sonnet 6"));
+}
+
+#[test]
+fn the_action_row_steps_through_project_and_is_never_a_remembered_field() {
+    let r = four();
+    let row = r.row(RowName::Action).unwrap();
+    assert_eq!(row.values.join(" "), "new project continue resume worktree");
+    assert!(!PROFILE_FIELDS.contains(&RowName::Action));
+    let mut s = r.new_state();
+    s.row = 2;
+    let labels = DefaultLabels::new();
+    let ctx = OptionText::plain(None, &labels);
+    step_launch_value(&r, &mut s, 1, &ctx);
+    assert_eq!(s.action, "project");
+    assert_eq!(
+        launch_args(&r, &s, None, false, None, "", ""),
+        [] as [String; 0],
+        "project adds no flag"
+    );
 }

@@ -90,9 +90,9 @@ fn wide_frames_match_the_powershell_goldens() {
     let fresh = r.new_state();
     let real = real_state(&r);
     let mut hover = r.new_state();
-    hover.row = 3;
+    hover.row = 4;
     hover.hover = 1;
-    hover.hover_row = 3;
+    hover.hover_row = 4;
     hover.hover_value = "max".into();
     let long_bucket: Limits = [(
         "work".to_owned(),
@@ -196,8 +196,8 @@ fn narrow_tier_draws_compact_rows_and_one_limit_line() {
         f.lines
     );
     assert!(
-        f.lines.iter().any(|l| l == "   advisor      < default >"),
-        "and every other value row with them: {:#?}",
+        f.lines.iter().any(|l| l.starts_with("   mode") && !l.contains('<')),
+        "a row that fits stays a radio list: {:#?}",
         f.lines
     );
     assert!(f.lines.len() < MIN_HEIGHT, "the narrow worst case stays under the minimum height");
@@ -236,26 +236,22 @@ fn value_column(f: &Frame, r: &Roster, name: &str) -> usize {
 }
 
 #[test]
-fn narrow_value_rows_collapse_all_or_none() {
+fn a_narrow_row_collapses_only_when_it_does_not_fit() {
     let r = four();
     let limits = golden_limits();
     let s = r.new_state();
     for width in [50, 58, 60, 70, 80, 90, 99] {
         let f = frame_at(&r, &s, &limits, width);
-        let rows: Vec<&String> = f
-            .map
-            .rows
-            .iter()
-            .filter(|h| h.name != "Account")
-            .map(|h| &f.lines[usize::try_from(h.y).unwrap()])
-            .collect();
-        let collapsed = rows.iter().filter(|l| l.contains('‹')).count();
-        assert!(collapsed == 0 || collapsed == rows.len(), "{width}: {:#?}", f.lines);
-        if collapsed == 0 {
-            assert!(rows.iter().all(|l| l.contains('●')), "{width}: radio lists: {:#?}", f.lines);
-        }
+        let row = |name: &str| {
+            let hit = f.map.rows.iter().find(|h| h.name == name).unwrap();
+            f.lines[usize::try_from(hit.y).unwrap()].clone()
+        };
+        assert!(row("Mode").contains('●'), "{width}: a short row stays a radio list: {:#?}", f.lines);
         assert!(f.lines.iter().all(|l| display_width(l) < width), "{width}: {:#?}", f.lines);
     }
+    let narrow = frame_at(&r, &s, &limits, 50);
+    let model = narrow.map.rows.iter().find(|h| h.name == "Model").unwrap();
+    assert!(narrow.lines[usize::try_from(model.y).unwrap()].contains('‹'), "{:#?}", narrow.lines);
 }
 
 #[test]

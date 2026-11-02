@@ -276,7 +276,7 @@ fn preview_steps_rows_into_launch_arguments() {
     let o = launcher(&d)
         .env("CLAUDE_AUTO_CONFIG", &config)
         .env("CLAUDE_AUTO_PREVIEW", "1")
-        .env("CLAUDE_AUTO_PREVIEW_KEYS", "RightArrow,s,s,d,s,d,d,d,d,s,d,Enter,Enter")
+        .env("CLAUDE_AUTO_PREVIEW_KEYS", "RightArrow,s,s,s,d,s,d,d,d,d,s,d,Enter")
         .output()
         .unwrap();
     let out = text(&o);
@@ -286,5 +286,80 @@ fn preview_steps_rows_into_launch_arguments() {
         "{out}"
     );
     assert!(out.contains("CLAUDE_CONFIG_DIR  : "), "{out}");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+/// (local) Two accounts with separate stores, no remote: rows are account, action, then the habits.
+/// `b` holds one session recorded in the launcher's working directory.
+fn two_accounts(name: &str) -> PathBuf {
+    let d = scratch(name);
+    fake_claude(&d);
+    let config = serde_json::json!({
+        "accounts": [
+            { "key": "alpha", "root": "~/.claude", "label": "alpha", "tint": "Green" },
+            { "key": "beta", "root": "~/.claude-b", "label": "beta", "tint": "Magenta" }
+        ],
+        "sharing": false,
+        "remote": false
+    });
+    std::fs::write(d.join("home").join("config.json"), config.to_string()).unwrap();
+    let slug_dir = d.join("home").join(".claude-b").join("projects").join("SLUG");
+    std::fs::create_dir_all(&slug_dir).unwrap();
+    let record = serde_json::json!({
+        "type": "user",
+        "cwd": d.to_string_lossy(),
+        "message": { "role": "user", "content": "the foreign prompt" }
+    });
+    std::fs::write(slug_dir.join("foreign-id.jsonl"), format!("{record}\n")).unwrap();
+    std::fs::create_dir_all(d.join("home").join(".claude").join("projects")).unwrap();
+    d
+}
+
+fn preview_two(d: &Path, keys: &str) -> String {
+    let o = launcher(d)
+        .env("CLAUDE_AUTO_CONFIG", d.join("home").join("config.json"))
+        .env("CLAUDE_AUTO_PREVIEW", "1")
+        .env("CLAUDE_AUTO_PREVIEW_KEYS", keys)
+        .output()
+        .unwrap();
+    text(&o)
+}
+
+#[test]
+fn enter_on_the_launch_screen_starts_in_the_launch_directory() {
+    let d = two_accounts("direct");
+    let out = preview_two(&d, "Enter");
+    assert!(out.contains("--- preview, nothing launched ---"), "one Enter launches: {out}");
+    assert!(!out.contains("current directory"), "no project screen: {out}");
+    assert!(
+        out.contains("action") && out.contains("[new]") && out.contains("project"),
+        "the row is on the screen: {out}"
+    );
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn the_project_action_opens_the_project_screen_over_every_account() {
+    let d = two_accounts("project");
+    let out = preview_two(&d, "s,d,Enter,Escape");
+    assert!(out.contains("current directory"), "the project screen opened: {out}");
+    assert!(out.contains("--- preview: picker cancelled ---"), "{out}");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn resume_lists_another_accounts_session_and_preview_copies_nothing() {
+    let d = two_accounts("transfer");
+    let out = preview_two(&d, "s,d,d,d,Enter,Enter");
+    assert!(out.contains("[beta]"), "the row names its owner: {out}");
+    assert!(
+        out.contains("session transfer   : foreign-id from beta -> alpha (copied on a real launch)"),
+        "{out}"
+    );
+    assert!(out.contains("launch args        : --resume foreign-id"), "{out}");
+    assert!(
+        !d.join("home").join(".claude").join("projects").join("SLUG").exists(),
+        "preview writes nothing"
+    );
     std::fs::remove_dir_all(&d).unwrap();
 }

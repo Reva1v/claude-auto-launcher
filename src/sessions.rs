@@ -3,6 +3,7 @@
 //! `sessions/`: `transcript` (records), `listing` (summaries, snapshot, cache), `frame` (the
 //! picker frame and memo), `picker` (the screen), `holder` (another live claude on a session).
 
+pub mod cross_account;
 pub mod frame;
 pub mod holder;
 pub mod listing;
@@ -18,6 +19,7 @@ use crate::config::{Config, PathCtx};
 use crate::frame::Style;
 use crate::ui::{Term, UiStop};
 
+use self::cross_account::{OtherStore, Transfer, joined_snapshot, tag_sessions, transfer_of};
 use self::frame::Clock;
 use self::listing::{Scope, SessionCache, cache_path, session_files};
 use self::picker::PickerScreen;
@@ -30,12 +32,32 @@ const PAGE_SIZE: usize = 10;
 pub struct PickedSession {
     pub session_id: String,
     pub fork: bool,
+    /// (local) Set when the session lives in another account's store.
+    pub transfer: Option<Transfer>,
+}
+
+/// (local) Every other account's projects store, for the picker. With `sharing` on all accounts
+/// read one root, so there is nothing else to fold in.
+pub fn other_stores(cfg: &Config, account: &str) -> Vec<OtherStore> {
+    if cfg.sharing {
+        return Vec::new();
+    }
+    cfg.accounts
+        .iter()
+        .filter(|a| !a.key.eq_ignore_ascii_case(account))
+        .map(|a| OtherStore {
+            account: a.key.clone(),
+            root: Path::new(&a.root).join("projects"),
+        })
+        .collect()
 }
 
 /// Everything the picker is opened with.
 #[derive(Debug, Clone)]
 pub struct PickerRequest<'a> {
     pub sessions_root: PathBuf,
+    /// (local) The other accounts' stores folded into the list.
+    pub others: &'a [OtherStore],
     /// Every slug of the chosen project; empty = the whole account.
     pub project_slugs: &'a [String],
     pub project_name: &'a str,
@@ -86,8 +108,12 @@ pub fn run_picker(term: &mut dyn Term, req: &PickerRequest<'_>) -> Result<Option
     let mut cache = SessionCache::new(req.preview);
     let mut snapshots: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut fetch = |have: usize, slugs: &[String]| {
-        let snap = snapshots.entry(slugs.join("|")).or_insert_with(|| session_files(&root, slugs));
-        cache.list(&root, Scope::Files(snap), have, PAGE_SIZE, &cache_file)
+        let snap = snapshots
+            .entry(slugs.join("|"))
+            .or_insert_with(|| joined_snapshot(session_files(&root, slugs), req.others, slugs));
+        let mut page = cache.list(&root, Scope::Files(snap), have, PAGE_SIZE, &cache_file);
+        tag_sessions(&mut page, req.others);
+        page
     };
     let slugs: Vec<String> = req.project_slugs.iter().filter(|s| !s.is_empty()).cloned().collect();
     let first = fetch(0, &slugs);
@@ -95,6 +121,7 @@ pub fn run_picker(term: &mut dyn Term, req: &PickerRequest<'_>) -> Result<Option
     tm.end(load);
     let picked = crate::ui::screen_loop::run(&mut screen, term)?;
     Ok(picked.map(|p| PickedSession {
+        transfer: transfer_of(&p.session),
         session_id: p.session.session_id,
         fork: p.fork,
     }))
@@ -199,6 +226,7 @@ mod tests {
         std::fs::write(d.join("s1.jsonl"), "{\"type\":\"user\",\"message\":{\"content\":\"p\"}}\n").unwrap();
         let req = PickerRequest {
             sessions_root: base.join("projects"),
+            others: &[],
             project_slugs: &["C--src-p".to_owned()],
             project_name: "p",
             style: Style { color: false, ascii: true },

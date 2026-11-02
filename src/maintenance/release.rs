@@ -121,6 +121,33 @@ pub(crate) fn remote_version(
     fetched.map(|_| version)
 }
 
+/// (local) The cached answer for this channel at ANY age, and whether it has expired: the launch
+/// never waits for the network when it knows a version. `None` = nothing to go on, ask inline.
+pub(crate) fn stale_version(channel: &str, cache: &Path, now_ms: i64) -> Option<(String, bool)> {
+    let c = serde_json::from_str::<Value>(std::fs::read_to_string(cache).ok()?.trim_start_matches('\u{feff}')).ok()?;
+    if !c.get("Channel")?.as_str()?.eq_ignore_ascii_case(channel) {
+        return None;
+    }
+    let version = c.get("Version")?.as_str().filter(|v| !v.is_empty())?.to_owned();
+    let age = now_ms - c.get("CheckedAtMs").and_then(Value::as_i64).unwrap_or(0);
+    Some((version, !(0..TTL_MS).contains(&age)))
+}
+
+/// (local) The background refresh of an expired answer. A failed request leaves the known version
+/// in place, so an offline spell never turns the next launch back into an inline request.
+pub(crate) fn refresh_version(channel: &str, cache: &Path, now_ms: i64, fetch: &mut dyn FnMut(&str) -> Result<String, FetchFailed>) {
+    let Ok(body) = fetch(&format!("{RELEASE_ENDPOINT}/{channel}")) else {
+        return;
+    };
+    let version = CHANNEL_BODY.captures(body.trim()).and_then(|c| c.get(1)).map(|m| m.as_str());
+    if version.is_some() {
+        write_atomic(
+            cache,
+            &json!({ "Channel": channel, "Version": version, "CheckedAtMs": now_ms }).to_string(),
+        );
+    }
+}
+
 /// `Test-ClaudeUpdateAvailable`: both parse as versions and `remote` is strictly newer. An
 /// unparseable side never starts an update.
 pub(crate) fn update_available(installed: Option<&str>, remote: Option<&str>) -> bool {
@@ -185,6 +212,27 @@ mod tests {
             ],
             "a hit makes no request, another channel and an expired entry do"
         );
+    }
+
+    #[test]
+    fn an_expired_answer_still_answers_and_a_failed_refresh_keeps_it() {
+        let t = tmp();
+        let upd = t.0.join("update-cache.json");
+        let t0 = 1_000_000_000_000;
+        assert_eq!(stale_version("latest", &upd, t0), None, "no cache: ask inline");
+        let mut ok = |_: &str| -> Result<String, FetchFailed> { Ok("2.1.280\n".into()) };
+        refresh_version("latest", &upd, t0, &mut ok);
+        assert_eq!(stale_version("latest", &upd, t0 + 60_000), Some(("2.1.280".into(), false)));
+        assert_eq!(stale_version("latest", &upd, t0 + 60 * 60_000), Some(("2.1.280".into(), true)));
+        assert_eq!(stale_version("stable", &upd, t0), None, "another channel's answer is no answer");
+        let mut down = |_: &str| -> Result<String, FetchFailed> { Err(FetchFailed::Offline) };
+        refresh_version("latest", &upd, t0 + 60 * 60_000, &mut down);
+        let mut garbage = |_: &str| -> Result<String, FetchFailed> { Ok("<html>".into()) };
+        refresh_version("latest", &upd, t0 + 60 * 60_000, &mut garbage);
+        assert_eq!(stale_version("latest", &upd, t0), Some(("2.1.280".into(), false)), "kept");
+        let mut newer = |_: &str| -> Result<String, FetchFailed> { Ok("2.1.281".into()) };
+        refresh_version("latest", &upd, t0 + 60 * 60_000, &mut newer);
+        assert_eq!(stale_version("latest", &upd, t0 + 60 * 60_000), Some(("2.1.281".into(), false)));
     }
 
     #[test]

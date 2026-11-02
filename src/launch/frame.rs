@@ -220,14 +220,6 @@ pub fn launch_frame(roster: &Roster, inp: &LaunchFrameInput<'_>) -> Frame {
             &g,
         )
     };
-    // The narrow tier draws every value row one way: all as radio lists when each one fits,
-    // else all collapsed to `< value >`.
-    let collapse_all = !wide
-        && roster
-            .rows
-            .iter()
-            .filter(|r| r.name != RowName::Account)
-            .any(|r| display_width(&radio_of(r, "   ", "").text) > inner);
     let mut body: Vec<String> = Vec::new();
     let mut hits: Vec<(usize, &'static str, usize, Vec<CellSpan>)> = Vec::new();
     for (i, row) in roster.rows.iter().enumerate() {
@@ -244,7 +236,8 @@ pub fn launch_frame(roster: &Roster, inp: &LaunchFrameInput<'_>) -> Frame {
             let radio = radio_of(row, &prefix, if hovered_here { &state.hover_value } else { "" });
             (radio.text, radio.cells)
         };
-        if (collapse_all && row.name != RowName::Account) || display_width(&line) > inner {
+        // (local) Only a row that does not fit collapses to `< value >`: the others stay readable.
+        if display_width(&line) > inner {
             line = format!(
                 "{prefix}{label_part}{} {} {}",
                 g.l_angle,
@@ -375,7 +368,7 @@ static SGR_ROW_LABEL: LazyLock<Regex> = LazyLock::new(|| theme::re(r"^.{3}accoun
 static COMPACT_PREFIX: LazyLock<Regex> = LazyLock::new(|| theme::re("^.{3}[a-z]+\\*? +(?:[^\\s\\[\\]]+ )*\u{4}?$"));
 static BRACKET: LazyLock<Regex> = LazyLock::new(|| theme::re(r"\[([^\[\]]+)\]"));
 static PERCENT: LazyLock<Regex> = LazyLock::new(|| theme::re(r"(\d+)%"));
-static ROW_WORDS: LazyLock<Regex> = LazyLock::new(|| theme::re(r"\b(account|model|effort|advisor|permission|remote|mode)\b"));
+static ROW_WORDS: LazyLock<Regex> = LazyLock::new(|| theme::re(r"\b(account|action|model|effort|advisor|permission|remote|mode)\b"));
 static AGE: LazyLock<Regex> = LazyLock::new(|| theme::re(r"(\d+ (?:min|h|d) ago|just now)"));
 
 /// The selected cell's bracket `[...]` with at most one nested pair, starting at `open`

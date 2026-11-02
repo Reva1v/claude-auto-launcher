@@ -77,6 +77,65 @@ pub fn project_registry(cache_path: Option<&Path>, profile_roots: &[String]) -> 
     })
 }
 
+/// (local) `Get-AllAccountsProjectRegistry`: every project Claude was opened in, from EVERY account's
+/// `<root>\projects`, one row per real directory: every slug (the picker scopes on them and reads
+/// both stores), the newest activity, and hidden only when no account shows it. `preview` keeps each
+/// registry's cache in the temp folder. `CLAUDE_AUTO_PROJECTS_ROOT` still names one root.
+pub fn all_accounts_registry(account_roots: &[String], profile_roots: &[String], preview: bool) -> Vec<Project> {
+    if std::env::var_os("CLAUDE_AUTO_PROJECTS_ROOT").is_some_and(|v| !v.is_empty()) {
+        let cache = preview.then(|| std::env::temp_dir().join(format!("claude-auto-projects-preview-{}.json", std::process::id())));
+        return project_registry(cache.as_deref(), profile_roots);
+    }
+    let temp = paths::temp_roots(&paths::default_temp_candidates(), &home().to_string_lossy());
+    let lists = account_roots.iter().enumerate().map(|(i, root)| {
+        let projects_root = Path::new(root).join("projects");
+        let cache_path = if preview {
+            std::env::temp_dir().join(format!("claude-auto-projects-preview-{}-{i}.json", std::process::id()))
+        } else {
+            Path::new(root).join("claude-auto-projects.json")
+        };
+        registry::build_registry(&registry::RegistryInput {
+            projects_root: &projects_root,
+            cache_path: &cache_path,
+            temp_roots: &temp,
+            profile_roots,
+        })
+    });
+    merge_registries(lists)
+}
+
+fn merge_registries(lists: impl Iterator<Item = Vec<Project>>) -> Vec<Project> {
+    let mut merged: Vec<(String, Project)> = Vec::new();
+    for p in lists.flatten() {
+        let key = project_key(&p.path);
+        let Some((_, have)) = merged.iter_mut().find(|(k, _)| *k == key) else {
+            merged.push((key, p));
+            continue;
+        };
+        let mut slugs = std::mem::take(&mut have.slugs);
+        let hidden = have.hidden && p.hidden;
+        let newer = p.last_activity_ms > have.last_activity_ms;
+        let (first, second) = if newer { (&p.slugs, &slugs) } else { (&slugs, &p.slugs) };
+        let mut all: Vec<String> = first.iter().chain(second).cloned().collect();
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|s| seen.insert(s.to_lowercase()));
+        slugs = all;
+        if newer {
+            *have = p;
+        }
+        have.slugs = slugs;
+        have.hidden = hidden;
+    }
+    let mut out: Vec<Project> = merged.into_iter().map(|(_, p)| p).collect();
+    out.sort_by_key(|p| std::cmp::Reverse(p.last_activity_ms));
+    out
+}
+
+/// (local) Every slug of the directory a path names (the launch directory's picker scope).
+pub fn slugs_for(projects: &[Project], path: &Path) -> Vec<String> {
+    select::slugs_for_path(projects, &path.to_string_lossy())
+}
+
 /// The profile roots the launcher hands `project_registry` (`Get-ProjectProfileRoots` plus the
 /// roster, claude-auto.ps1): `~\.claude`, the `CLAUDE_CONFIG_DIR` this process started with, then
 /// every account root.
@@ -148,11 +207,30 @@ pub fn remove_stale_preview_cache(dir: &Path) {
     registry::remove_stale_preview_cache_at(dir, SystemTime::now());
 }
 
+/// (local) This run's per-PID preview caches, one per account. Best effort: the next preview sweeps
+/// what a failure leaves.
+pub fn remove_own_preview_caches(dir: &Path) {
+    let prefix = format!("claude-auto-projects-preview-{}", std::process::id());
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if e.file_name().to_string_lossy().starts_with(&prefix) && std::fs::remove_file(e.path()).is_err() {
+            // Swept by age on a later preview.
+        }
+    }
+}
+
 /// `Invoke-ProjectScreen`: where the session runs and what it does there. `None` = Escape, back to
-/// the launch screen. The cursor opens on the current directory and the action field on `new`.
-pub fn run_project_screen(term: &mut dyn Term, projects: &[Project], cwd: &Path, style: Style) -> Result<Option<ProjectChoice>, UiStop> {
+/// the launch screen. The cursor opens on the current directory; the action field on `action`
+/// (local: the launch screen's own row, so Enter here runs what was chosen one screen up).
+pub fn run_project_screen(
+    term: &mut dyn Term,
+    projects: &[Project],
+    cwd: &Path,
+    action: &str,
+    style: Style,
+) -> Result<Option<ProjectChoice>, UiStop> {
     let clock = || registry::unix_ms(SystemTime::now());
-    screen::run_screen(term, projects, cwd, "new", style, &clock)
+    screen::run_screen(term, projects, cwd, action, style, &clock)
 }
 
 #[cfg(test)]
@@ -184,6 +262,27 @@ mod tests {
         let mut g = state();
         assert_eq!(set_launch_start_project(&mut g, &repo, &ps), "cwd");
         assert_eq!((g.project.as_str(), g.project_slug.as_str()), (repo.to_str().unwrap(), ""));
+    }
+
+    #[test]
+    fn registries_merge_per_directory_with_every_slug_and_the_newest_activity() {
+        let row = |slug: &str, path: &str, ms: i64, hidden: bool| Project {
+            slugs: vec![slug.to_owned()],
+            last_activity_ms: Some(ms),
+            hidden,
+            ..proj(slug, path, "p")
+        };
+        let main = vec![row("M", r"C:\w\both", 100, true), row("OLD", r"C:\w\main-only", 50, false)];
+        let mamoru = vec![row("R", r"c:/w/BOTH/", 200, false), row("NEW", r"C:\w\mamoru-only", 300, false)];
+        let got = merge_registries([main, mamoru].into_iter());
+        assert_eq!(
+            got.iter().map(|p| p.slug.as_str()).collect::<Vec<_>>(),
+            ["NEW", "R", "OLD"],
+            "one row per directory, newest first, the newer account's slug on top"
+        );
+        assert_eq!(got[1].slugs, ["R", "M"]);
+        assert_eq!(got[1].last_activity_ms, Some(200));
+        assert!(!got[1].hidden, "hidden only when no account shows it");
     }
 
     #[test]

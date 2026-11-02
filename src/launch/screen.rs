@@ -280,9 +280,9 @@ mod tests {
 
     #[test]
     fn down_then_right_steps_the_model() {
-        let s = drive("DownArrow,DownArrow,RightArrow,Enter").unwrap();
+        let s = drive("DownArrow,DownArrow,DownArrow,RightArrow,Enter").unwrap();
         assert_eq!(s.model, "fable");
-        assert_eq!(s.row, 2);
+        assert_eq!(s.row, 3);
     }
 
     #[test]
@@ -405,7 +405,7 @@ mod tests {
         };
         let out = run(&mut s, &mut t).unwrap().unwrap();
         assert_eq!(out.effort, "max");
-        assert_eq!(out.row, 3);
+        assert_eq!(out.row, 4);
         let frames = t.inner.frames.unwrap();
         assert!(
             frames.get(1).unwrap().iter().any(|l| l.contains("max")),
