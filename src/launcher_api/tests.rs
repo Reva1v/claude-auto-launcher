@@ -257,6 +257,14 @@ fn a_saved_remote_off_never_turns_the_bridge_off_for_a_phone_launch() {
 }
 
 #[test]
+fn a_phone_launch_leaves_the_pc_choices_alone() {
+    // The next launch from the screen would start on whatever the phone picked for one session.
+    assert!(!saves_choice(false, true));
+    assert!(saves_choice(false, false), "the screen remembers, as it always did");
+    assert!(!saves_choice(true, false), "a preview changes nothing");
+}
+
+#[test]
 fn the_screen_keeps_its_own_remote_switch() {
     assert!(!remote_wanted(true, "off", false));
     assert!(remote_wanted(true, "on", false));

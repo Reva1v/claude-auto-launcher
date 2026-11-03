@@ -237,6 +237,12 @@ pub fn remote_wanted(feature_on: bool, saved_row: &str, phone: bool) -> bool {
     feature_on && (phone || saved_row != "off")
 }
 
+/// Is this launch's choice remembered for the next one. The phone's pick is for that one session, by
+/// the owner's decision: saved, the next launch on the PC would quietly start on it.
+pub const fn saves_choice(preview: bool, phone: bool) -> bool {
+    !preview && !phone
+}
+
 /// Where the launch came from, as far as the bridge cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LaunchSource {

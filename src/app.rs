@@ -271,16 +271,15 @@ fn launch(run: &Run) -> i32 {
 
     let mut child = ChildEnv::default();
     if let Some(o) = &ui {
-        let saved = if run.preview {
-            Value::Null
-        } else {
-            let save = if phone { prefs::save_prefs_keep_remote } else { prefs::save_prefs };
-            save(
+        let saved = if launcher_api::saves_choice(run.preview, phone) {
+            prefs::save_prefs(
                 &prefs::prefs_path(&run.ctx, var("CLAUDE_AUTO_PREFS").as_deref()),
                 &o.state,
                 now_ms(),
                 &run.roster,
             )
+        } else {
+            Value::Null
         };
         if o.state.advisor.eq_ignore_ascii_case("off") {
             child.set("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1");

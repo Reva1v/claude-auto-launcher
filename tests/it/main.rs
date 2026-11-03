@@ -566,28 +566,23 @@ fn launcher_run_starts_claude_in_the_project_and_keeps_the_remembered_remote() {
         "the saved `off` still takes the ensure path, which alone reports this: {out}"
     );
 
-    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("prefs.json")).unwrap()).unwrap();
-    assert_eq!(saved["Account"], "alt");
     assert_eq!(
-        saved["Profiles"]["alt"]["Remote"], "off",
-        "the phone does not rewrite the owner's switch"
+        std::fs::read_to_string(d.join("prefs.json")).unwrap(),
+        r#"{"Version":2,"Profiles":{"alt":{"Remote":"off","Model":"fable"}}}"#,
+        "the phone's choice is for this launch: the next one on the PC starts on what the PC remembers"
     );
-    assert_eq!(saved["Profiles"]["alt"]["Model"], "haiku", "the phone's choice is remembered");
     assert!(logs_dir(&d).exists(), "the launch logs as one from the screen does");
     std::fs::remove_dir_all(&d).unwrap();
 }
 
 #[test]
-fn launcher_run_does_not_write_a_remote_the_owner_never_chose() {
-    // Запуск с телефона на профиле без запомненной строки: экранное сохранение записало бы `on`.
-    let d = scratch("run-no-remote");
+fn launcher_run_does_not_create_prefs_on_a_first_launch_from_the_phone() {
+    // Запуск с телефона не должен заводить запомненные значения: экран при первом запуске начинал бы с чужого выбора.
+    let d = scratch("run-no-prefs");
     fake_claude_with_cwd(&d);
-    std::fs::write(d.join("prefs.json"), r#"{"Version":2,"Profiles":{"main":{"Model":"fable"}}}"#).unwrap();
     let o = phone_launcher(&d).args(run_line(&d, &[])).output().unwrap();
     assert_eq!(o.status.code(), Some(7), "{}", text(&o));
-    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("prefs.json")).unwrap()).unwrap();
-    assert_eq!(saved["Profiles"]["main"]["Model"], "haiku");
-    assert!(saved["Profiles"]["main"].get("Remote").is_none(), "{saved}");
+    assert!(!d.join("prefs.json").exists());
     std::fs::remove_dir_all(&d).unwrap();
 }
 

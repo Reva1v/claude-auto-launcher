@@ -194,36 +194,6 @@ pub fn build_prefs_data(prev: &Prefs, state: &LaunchState, now_ms: i64, roster: 
     json!({ "Version": 2, "Account": account, "SavedAtMs": now_ms, "Profiles": profiles })
 }
 
-/// (local) `build_prefs_data` for a launch from the phone: the `Remote` of this account stays exactly
-/// as the file has it, absent included. The row is the owner's switch on the PC; a phone launch never
-/// saw it, and writing `on` here would raise the bridge on his next launch from the screen. Taken from
-/// `prev`, read under the save's lock, so a change made meanwhile is not undone.
-pub fn build_prefs_keep_remote(prev: &Prefs, state: &LaunchState, now_ms: i64, roster: &Roster) -> Value {
-    let key = RowName::Remote.as_str();
-    let kept = profile(prev, &state.account).and_then(|e| e.get(key)).cloned();
-    let mut data = build_prefs_data(prev, state, now_ms, roster);
-    if let Some(entry) = data
-        .get_mut("Profiles")
-        .and_then(|p| p.get_mut(&state.account))
-        .and_then(Value::as_object_mut)
-    {
-        match kept {
-            Some(v) => {
-                entry.insert(key.into(), v);
-            }
-            None => {
-                entry.remove(key);
-            }
-        }
-    }
-    data
-}
-
-/// (local) `save_prefs` with the remembered `Remote` kept (`build_prefs_keep_remote`).
-pub fn save_prefs_keep_remote(path: &str, state: &LaunchState, now_ms: i64, roster: &Roster) -> Value {
-    save_with(path, |prev| build_prefs_keep_remote(prev, state, now_ms, roster))
-}
-
 /// (local) One account's remembered rows on a fresh state, the way a tab shows them on the screen;
 /// `restored` names the rows that came from the file. No project: a phone launch names its own.
 pub fn account_state(prefs: &Prefs, account: &str, roster: &Roster) -> LaunchState {
