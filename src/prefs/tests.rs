@@ -220,3 +220,70 @@ fn mutex_name_is_stable_and_path_free() {
     assert!(a.starts_with("Local\\claude-auto-prefs-"));
     assert_eq!(a.len(), "Local\\claude-auto-prefs-".len() + 32);
 }
+
+/// (local) A phone launch rewrites this account's entry with the phone's rows.
+fn phone_state(roster: &Roster) -> LaunchState {
+    let mut s = roster.new_state();
+    s.model = "haiku".into();
+    s.effort = "low".into();
+    s.project = r"C:\p".into();
+    s
+}
+
+fn remote_after(prev: &str) -> (Option<Value>, Value) {
+    let r = four();
+    let data = build_prefs_keep_remote(&parse_prefs(prev), &phone_state(&r), 5, &r);
+    let entry = data["Profiles"]["work"].clone();
+    (entry.get("Remote").cloned(), entry)
+}
+
+#[test]
+fn a_phone_launch_leaves_a_remembered_remote_off_as_it_was() {
+    // Иначе следующий запуск с экрана увидел бы `on` и поднял мост, который владелец выключил.
+    let (remote, entry) = remote_after(r#"{"Version":2,"Profiles":{"work":{"Remote":"off","Model":"fable"}}}"#);
+    assert_eq!(remote, Some(json!("off")));
+    assert_eq!(entry["Model"], "haiku", "the phone's rows are remembered as the screen's are");
+    assert_eq!(entry["Effort"], "low");
+    assert_eq!(entry["Project"], r"C:\p");
+}
+
+#[test]
+fn a_phone_launch_does_not_invent_a_remote_nobody_chose() {
+    let (remote, _) = remote_after(r#"{"Version":2,"Profiles":{"work":{"Model":"fable"}}}"#);
+    assert_eq!(remote, None);
+    let (remote, _) = remote_after("{}");
+    assert_eq!(remote, None, "a first launch from the phone too");
+}
+
+#[test]
+fn a_phone_launch_keeps_the_other_accounts_and_marks_the_chosen_one() {
+    let r = four();
+    let prev = parse_prefs(r#"{"Version":2,"Account":"personal","Profiles":{"personal":{"Remote":"off","Model":"fable"}}}"#);
+    let data = build_prefs_keep_remote(&prev, &phone_state(&r), 5, &r);
+    assert_eq!(data["Account"], "work");
+    assert_eq!(data["Profiles"]["personal"], json!({"Remote": "off", "Model": "fable"}));
+}
+
+#[test]
+fn saving_a_phone_launch_writes_the_kept_remote_to_the_file() {
+    let t = Tmp::new("keep-remote");
+    let p = t.0.join("k.json").to_string_lossy().into_owned();
+    std::fs::write(&p, r#"{"Version":2,"Profiles":{"work":{"Remote":"off"}}}"#).unwrap();
+    let r = four();
+    save_prefs_keep_remote(&p, &phone_state(&r), 5, &r);
+    let after = read_prefs(&p);
+    let entry = after.profiles["work"].as_object().unwrap();
+    assert_eq!(entry["Remote"], "off");
+    assert_eq!(entry["Model"], "haiku");
+}
+
+#[test]
+fn remembered_rows_of_one_account_load_without_touching_the_remembered_account() {
+    let r = four();
+    let prefs = parse_prefs(r#"{"Version":2,"Account":"work","Profiles":{"personal":{"Model":"FABLE","Remote":"off"}}}"#);
+    let s = account_state(&prefs, "personal", &r);
+    assert_eq!(s.account, "personal");
+    assert_eq!(s.model, "fable", "in the row's own casing");
+    assert_eq!(s.remote, "off");
+    assert_eq!(account_state(&prefs, "low", &r).model, "default");
+}

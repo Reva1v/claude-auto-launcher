@@ -118,7 +118,9 @@ claude-auto --launcher-version           # the launcher's own version
 ```
 
 Every argument goes to `claude` untouched, except the launcher's own `--launcher-version`,
-`--launcher-debug` and `--launcher-timings`. `--version` belongs to the CLI.
+`--launcher-debug` and `--launcher-timings`, and (local) `--launcher-options` and `--launcher-run`,
+the screenless entries claude-tg-bridge uses to start a session from the phone. `--version` belongs
+to the CLI.
 
 ### Keys
 

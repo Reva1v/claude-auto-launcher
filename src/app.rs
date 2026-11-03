@@ -1,6 +1,7 @@
 //! The launch, in the order `claude-auto.ps1` runs it: argv pass-through, config, log, the UI
 //! (launch screen -> project screen -> picker), profile, secrets, sharing, hooks, MCP, exec.
 
+mod headless;
 mod prompts;
 mod screens;
 
@@ -13,6 +14,7 @@ use serde_json::{Value, json};
 use crate::config::{self, Config, PathCtx};
 use crate::launch::screen::LaunchView;
 use crate::launch::{LaunchState, Roster, launch_args};
+use crate::launcher_api::{self, BridgeStep, LaunchSource};
 use crate::log::{self, Logger};
 use crate::log_data;
 use crate::out::{self, Fg};
@@ -73,6 +75,8 @@ struct Run {
     logger: Logger,
     /// Debug mode's root span: process start to the spawn of claude.
     process: SpanId,
+    /// (local) `--launcher-run`, checked: this stands in for the screen's outcome.
+    phone: Option<headless::LauncherRun>,
 }
 
 /// The whole launcher. Returns the process exit code.
@@ -81,6 +85,21 @@ pub fn run(args: Vec<String>) -> i32 {
         out::line(&format!("claude-auto {VERSION}"), Fg::Plain);
         return 0;
     }
+    // (local) The launcher's own entries for the bridge. Only as the first argument, so a pass-through
+    // line that happens to carry the words still reaches claude. A bad line is refused here, before
+    // the config is even read.
+    let wants_options = args.first().is_some_and(|a| a == launcher_api::OPTIONS_FLAG);
+    if wants_options && args.len() > 1 {
+        return refuse(&format!("{} takes no arguments", launcher_api::OPTIONS_FLAG));
+    }
+    let run_request = if args.first().is_some_and(|a| a == launcher_api::RUN_FLAG) {
+        match launcher_api::parse_run_args(args.get(1..).unwrap_or_default()) {
+            Ok(req) => Some(req),
+            Err(e) => return refuse(&e),
+        }
+    } else {
+        None
+    };
     let preview = var("CLAUDE_AUTO_PREVIEW").as_deref() == Some("1");
     let started = Instant::now();
     let debug = timing::debug_mode(&args, var("CLAUDE_AUTO_DEBUG").as_deref());
@@ -94,9 +113,21 @@ pub fn run(args: Vec<String>) -> i32 {
     };
     let canonical = cfg.canonical().map(|a| (a.key.clone(), a.root.clone()));
     let roster = Roster::new(&cfg.accounts, cfg.remote, canonical.as_ref().map(|(k, _)| k.as_str()));
+    if wants_options {
+        // stderr: stdout is the one line of JSON the bridge parses.
+        for w in &cfg.warnings {
+            out::err_line(&format!("  config: {w}"));
+        }
+        return headless::print_options(&ctx, &cfg, &roster);
+    }
     for w in &cfg.warnings {
         out::line(&format!("  config: {w}"), Fg::DarkYellow);
     }
+    let phone = match run_request.map(|req| headless::prepare_run(&req, &ctx, &cfg, &roster)) {
+        Some(Ok(checked)) => Some(checked),
+        Some(Err(e)) => return refuse(&e),
+        None => None,
+    };
     let log_root = PathBuf::from(canonical.map_or_else(String::new, |(_, r)| r)).join("launcher-logs");
     if let Some(days) = timing::summary::parse_args(&args) {
         return print_timings(&log_root, days);
@@ -116,12 +147,19 @@ pub fn run(args: Vec<String>) -> i32 {
         roster,
         logger,
         process,
+        phone,
     };
     let code = launch(&run);
     // Every path but the spawn ends here; the spawn path ended and wrote these already.
     run.logger.timings.end(run.process);
     run.logger.write_timings();
     code
+}
+
+/// (local) A request the launcher's own entries cannot take: the bridge reads code 2 as "not started".
+fn refuse(why: &str) -> i32 {
+    out::err_line(&format!("claude-auto: {why}"));
+    2
 }
 
 /// `--timings [--days N]`: the table, then exit without the UI.
@@ -187,13 +225,15 @@ fn launch(run: &Run) -> i32 {
         let _s = run.logger.timings.scope(&["start log"]);
         log_start(run, input_redirected, output_redirected);
     }
-    let mut use_ui = run.preview || (!input_redirected && run.args.is_empty());
+    // (local) `--launcher-run` arrives with the screen's answer already made: no screen, no prompts.
+    let mut ui: Option<UiOutcome> = run.phone.as_ref().map(headless::LauncherRun::outcome);
+    let phone = run.phone.is_some();
+    let mut use_ui = !phone && (run.preview || (!input_redirected && run.args.is_empty()));
     if use_ui && !run.preview && sys::Handle::open_console("CONOUT$").and_then(|h| sys::window_size(&h)).is_none() {
         use_ui = false;
     }
     let mut choice = run.roster.default_account().to_owned();
     let mut remote_on = run.cfg.remote;
-    let mut ui: Option<UiOutcome> = None;
     if use_ui {
         let ui_span = run.logger.timings.begin(&["ui"]);
         let ended = run_ui(run, input_redirected, output_redirected);
@@ -225,7 +265,7 @@ fn launch(run: &Run) -> i32 {
                 return 1;
             }
         }
-    } else if !input_redirected && run.args.is_empty() {
+    } else if !phone && !input_redirected && run.args.is_empty() {
         fallback_prompts(run, &mut choice, &mut remote_on);
     }
 
@@ -234,7 +274,8 @@ fn launch(run: &Run) -> i32 {
         let saved = if run.preview {
             Value::Null
         } else {
-            prefs::save_prefs(
+            let save = if phone { prefs::save_prefs_keep_remote } else { prefs::save_prefs };
+            save(
                 &prefs::prefs_path(&run.ctx, var("CLAUDE_AUTO_PREFS").as_deref()),
                 &o.state,
                 now_ms(),
@@ -245,9 +286,7 @@ fn launch(run: &Run) -> i32 {
             child.set("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1");
         }
         choice.clone_from(&o.state.account);
-        if run.cfg.remote && o.state.remote == "off" {
-            remote_on = false;
-        }
+        remote_on = remote_on && launcher_api::remote_wanted(run.cfg.remote, &o.state.remote, phone);
         if !run.preview {
             run.logger.write(
                 "ui",
@@ -361,20 +400,28 @@ fn launch(run: &Run) -> i32 {
                 Fg::Plain,
             );
         }
+        if let Some(p) = &run.phone {
+            out::line(&format!("project            : {}", p.project()), Fg::Plain);
+        }
         preview_summary(&choice, &child, remote_on, &launch_argv, &claude, &argv);
         return 0;
     }
     // (local) The bridge serves every live session, so the row switches it for all of them; a launch
-    // with arguments (`-p`, a script) leaves it alone.
-    if run.cfg.remote && (use_ui || launch_argv.is_empty()) {
-        let status = if remote_on {
-            remote::ensure_bridge()
-        } else {
-            remote::stop_bridge()
-        };
-        if let Some(status) = status {
-            out::line(&format!("  remote: {status}"), Fg::DarkGray);
-        }
+    // with arguments (`-p`, a script) leaves it alone, and a launch from the phone only raises it.
+    let source = if phone {
+        LaunchSource::Phone
+    } else if use_ui || launch_argv.is_empty() {
+        LaunchSource::ScreenOrBare
+    } else {
+        LaunchSource::WithArguments
+    };
+    let status = match launcher_api::bridge_step(run.cfg.remote, remote_on, source) {
+        BridgeStep::Leave => None,
+        BridgeStep::Ensure => remote::ensure_bridge(),
+        BridgeStep::Stop => remote::stop_bridge(),
+    };
+    if let Some(status) = status {
+        out::line(&format!("  remote: {status}"), Fg::DarkGray);
     }
     run.logger.write(
         "decision",

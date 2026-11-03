@@ -363,3 +363,257 @@ fn resume_lists_another_accounts_session_and_preview_copies_nothing() {
     );
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+// (local) `--launcher-options` / `--launcher-run`. CLAUDE_BRIDGE_RUST=1 over a fake home is what makes
+// these safe to run: the bridge is then a file in that home that is not there, so the launcher can
+// neither start nor stop the real one, whatever the code under test decides.
+
+fn phone_launcher(dir: &Path) -> Command {
+    std::fs::write(
+        dir.join("home").join("config.json"),
+        r#"{"accounts":[{"key":"main","root":"~/.claude","label":"main acc","tint":"Green"},{"key":"alt","root":"~/.claude-alt","label":"alt acc","tint":"Magenta"}],"remote":true,"riderMcp":"off"}"#,
+    )
+    .unwrap();
+    let mut c = launcher(dir);
+    c.env("CLAUDE_AUTO_CONFIG", dir.join("home").join("config.json"))
+        .env("CLAUDE_BRIDGE_RUST", "1")
+        .env_remove("CLAUDE_BRIDGE_ROOT");
+    c
+}
+
+/// A fake `claude` that also says where it was started and leaves a file behind.
+fn fake_claude_with_cwd(dir: &Path) {
+    let marker = dir.join("claude-started");
+    std::fs::write(
+        dir.join("bin").join("claude.cmd"),
+        format!(
+            "@echo ARGV %*\r\n@echo CWD [%CD%]\r\n@echo CONFIG [%CLAUDE_CONFIG_DIR%]\r\n@echo. > \"{}\"\r\n@exit /b 7\r\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+}
+
+fn run_line(project: &Path, tail: &[&str]) -> Vec<String> {
+    let project = project.to_string_lossy().into_owned();
+    let mut line: Vec<String> = [
+        "--launcher-run",
+        "--account",
+        "main",
+        "--project",
+        project.as_str(),
+        "--model",
+        "haiku",
+        "--effort",
+        "high",
+        "--advisor",
+        "off",
+        "--permission",
+        "auto",
+        "--mode",
+        "safe",
+        "--action",
+        "new",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    for pair in tail.chunks(2) {
+        let (flag, value) = (pair[0], pair[1]);
+        if let Some(i) = line.iter().position(|a| a == flag) {
+            value.clone_into(&mut line[i + 1]);
+        } else {
+            line.extend([flag.to_owned(), value.to_owned()]);
+        }
+    }
+    line
+}
+
+fn logs_dir(dir: &Path) -> PathBuf {
+    dir.join("home").join(".claude").join("launcher-logs")
+}
+
+#[test]
+fn launcher_options_prints_one_line_of_json_and_leaves_no_trace() {
+    let d = scratch("options");
+    fake_claude_with_cwd(&d);
+    let prefs_text = r#"{"Version":2,"Account":"alt","Profiles":{"main":{"Effort":"medium","Remote":"off"}}}"#;
+    std::fs::write(d.join("prefs.json"), prefs_text).unwrap();
+    let rate = d.join("home").join(".claude").join("rate-limits");
+    std::fs::create_dir_all(&rate).unwrap();
+    std::fs::write(rate.join("main.json"), r#"{"fiveHour":16,"sevenDay":3,"atMs":1800000000000}"#).unwrap();
+    let versions = d.join("home").join(".local").join("share").join("claude").join("versions");
+    std::fs::create_dir_all(&versions).unwrap();
+    std::fs::write(versions.join("2.1.99"), "x").unwrap();
+
+    let started = std::time::Instant::now();
+    let o = phone_launcher(&d).arg("--launcher-options").output().unwrap();
+    let took = started.elapsed();
+
+    assert_eq!(o.status.code(), Some(0), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(took.as_secs_f64() < 3.0, "the bridge gives this 5 s and the owner 3: took {took:?}");
+    let out = text(&o);
+    assert_eq!(out.trim_end().lines().count(), 1, "one line, nothing else on stdout: {out}");
+    let v: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+    assert_eq!(v["launcher"], "claude-auto");
+    assert_eq!(v["version"], "2.1.99");
+    assert_eq!(v["accounts"][0]["key"], "main");
+    assert_eq!(v["accounts"][0]["limitPct"], 16);
+    assert_eq!(v["accounts"][0]["prefs"]["effort"], "medium");
+    assert_eq!(v["accounts"][1]["limitPct"], serde_json::Value::Null);
+
+    assert!(
+        !d.join("claude-started").exists(),
+        "the catalog and the version come without starting claude"
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.join("prefs.json")).unwrap(),
+        prefs_text,
+        "prefs stay as they were"
+    );
+    assert!(!logs_dir(&d).exists(), "no start log");
+    assert!(
+        !d.join("home").join(".claude").join("claude-auto-models.json").exists(),
+        "a cold catalog is not scanned"
+    );
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn launcher_options_keeps_config_warnings_off_the_json() {
+    let d = scratch("options-warn");
+    let mut c = phone_launcher(&d);
+    std::fs::write(d.join("home").join("config.json"), r#"{"nonsense":1,"remote":true}"#).unwrap();
+    c.env("CLAUDE_AUTO_CONFIG", d.join("home").join("config.json"));
+    let o = c.arg("--launcher-options").output().unwrap();
+    assert_eq!(o.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&o.stderr).is_empty(), "the warning is still said");
+    let _: serde_json::Value = serde_json::from_str(text(&o).trim_end()).unwrap();
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn launcher_options_refuses_extra_arguments_rather_than_passing_them_to_claude() {
+    let d = scratch("options-extra");
+    fake_claude_with_cwd(&d);
+    let o = phone_launcher(&d).args(["--launcher-options", "--x"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(!d.join("claude-started").exists());
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn launcher_run_refuses_a_bad_request_before_any_side_effect() {
+    let d = scratch("run-bad");
+    fake_claude_with_cwd(&d);
+    let prefs_text = r#"{"Version":2,"Profiles":{"main":{"Remote":"off"}}}"#;
+    std::fs::write(d.join("prefs.json"), prefs_text).unwrap();
+    let missing = d.join("no-such-dir");
+    let missing = missing.to_string_lossy();
+    for (name, tail) in [
+        ("unknown account", vec!["--account", "nobody"]),
+        ("value outside the row", vec!["--model", "gpt"]),
+        ("the project action", vec!["--action", "project"]),
+        ("missing directory", vec!["--project", &*missing]),
+        ("resume without an id", vec!["--action", "resume"]),
+        ("unknown flag", vec!["--whatever", "1"]),
+    ] {
+        let o = phone_launcher(&d).args(run_line(&d, &tail)).output().unwrap();
+        assert_eq!(o.status.code(), Some(2), "{name}");
+        assert!(!String::from_utf8_lossy(&o.stderr).is_empty(), "{name}: says why");
+        assert!(!d.join("claude-started").exists(), "{name}: claude did not start");
+        assert!(!logs_dir(&d).exists(), "{name}: no log was written");
+        assert_eq!(
+            std::fs::read_to_string(d.join("prefs.json")).unwrap(),
+            prefs_text,
+            "{name}: prefs untouched"
+        );
+    }
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn launcher_run_starts_claude_in_the_project_and_keeps_the_remembered_remote() {
+    let d = scratch("run");
+    fake_claude_with_cwd(&d);
+    let project = d.join("the project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        d.join("prefs.json"),
+        r#"{"Version":2,"Profiles":{"alt":{"Remote":"off","Model":"fable"}}}"#,
+    )
+    .unwrap();
+
+    let o = phone_launcher(&d)
+        .args(run_line(
+            &project,
+            &["--account", "alt", "--action", "resume", "--resume-id", "abc"],
+        ))
+        .arg("--fork")
+        .output()
+        .unwrap();
+    let out = text(&o);
+
+    assert_eq!(o.status.code(), Some(7), "claude's own code comes back: {out}");
+    assert!(
+        out.contains("--model haiku --effort high --permission-mode auto --safe-mode --resume abc --fork-session"),
+        "the screen's arguments: {out}"
+    );
+    assert!(out.contains(&format!("CWD [{}]", project.display())), "{out}");
+    assert!(out.contains(r".claude-alt]"), "the account's profile: {out}");
+    assert!(
+        out.contains("remote: no installed bridge"),
+        "the saved `off` still takes the ensure path, which alone reports this: {out}"
+    );
+
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("prefs.json")).unwrap()).unwrap();
+    assert_eq!(saved["Account"], "alt");
+    assert_eq!(
+        saved["Profiles"]["alt"]["Remote"], "off",
+        "the phone does not rewrite the owner's switch"
+    );
+    assert_eq!(saved["Profiles"]["alt"]["Model"], "haiku", "the phone's choice is remembered");
+    assert!(logs_dir(&d).exists(), "the launch logs as one from the screen does");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn launcher_run_does_not_write_a_remote_the_owner_never_chose() {
+    // Запуск с телефона на профиле без запомненной строки: экранное сохранение записало бы `on`.
+    let d = scratch("run-no-remote");
+    fake_claude_with_cwd(&d);
+    std::fs::write(d.join("prefs.json"), r#"{"Version":2,"Profiles":{"main":{"Model":"fable"}}}"#).unwrap();
+    let o = phone_launcher(&d).args(run_line(&d, &[])).output().unwrap();
+    assert_eq!(o.status.code(), Some(7), "{}", text(&o));
+    let saved: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.join("prefs.json")).unwrap()).unwrap();
+    assert_eq!(saved["Profiles"]["main"]["Model"], "haiku");
+    assert!(saved["Profiles"]["main"].get("Remote").is_none(), "{saved}");
+    std::fs::remove_dir_all(&d).unwrap();
+}
+
+#[test]
+fn launcher_run_in_preview_goes_the_same_way_and_launches_and_writes_nothing() {
+    let d = scratch("run-preview");
+    fake_claude_with_cwd(&d);
+    let prefs_text = r#"{"Version":2,"Profiles":{"main":{"Remote":"off"}}}"#;
+    std::fs::write(d.join("prefs.json"), prefs_text).unwrap();
+    let o = phone_launcher(&d)
+        .env("CLAUDE_AUTO_PREVIEW", "1")
+        .args(run_line(&d, &["--action", "worktree"]))
+        .output()
+        .unwrap();
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert!(out.contains("--- preview, nothing launched ---"), "no screen first: {out}");
+    assert!(out.contains("account            : main"), "{out}");
+    assert!(out.contains(&format!("project            : {}", d.display())), "{out}");
+    assert!(out.contains("remote             : True"), "the saved off does not switch it: {out}");
+    assert!(
+        out.contains("--model haiku --effort high --permission-mode auto --safe-mode -w"),
+        "{out}"
+    );
+    assert!(out.contains("disabled (CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1)"), "{out}");
+    assert!(!d.join("claude-started").exists());
+    assert_eq!(std::fs::read_to_string(d.join("prefs.json")).unwrap(), prefs_text);
+    std::fs::remove_dir_all(&d).unwrap();
+}

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::PathCtx;
+use crate::config::{Config, PathCtx};
 use crate::frame::{self, Style};
 use crate::input::console::ConsoleInput;
 use crate::input::{Event, KeyPress, is_hotkey, vk};
@@ -42,22 +42,7 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
         roster.set_model_labels(&labels);
     }
     let accounts = tm.begin(&["accounts"]);
-    let canonical_root = run.cfg.canonical().map(|a| a.root.clone()).unwrap_or_default();
-    let settings = |root: &str| Path::new(root).join("settings.json");
-    let rate_dir = var("CLAUDE_AUTO_RATE_LIMITS_DIR").map_or_else(|| run.ctx.home.join(".claude").join("rate-limits"), PathBuf::from);
-    let view = LaunchView {
-        limits: env::rate_limit_summary(&run.cfg.accounts, &rate_dir, now_ms()),
-        version,
-        default_model_label: env::default_model_label(&settings(&canonical_root)),
-        default_advisor_label: env::default_advisor_label(&settings(&canonical_root)),
-        labels_by_account: run
-            .cfg
-            .accounts
-            .iter()
-            .map(|a| (a.key.clone(), env::default_labels(&settings(&a.root))))
-            .collect(),
-        style,
-    };
+    let view = launch_view(&run.cfg, &run.ctx, version, style);
     tm.end(accounts);
     let console = tm.begin(&["console"]);
     let mut term: Box<dyn Term> = if run.preview {
@@ -253,6 +238,26 @@ pub(super) fn run_ui(run: &Run, input_redirected: bool, output_redirected: bool)
         projects::remove_own_preview_caches(&std::env::temp_dir());
     }
     Ok(outcome)
+}
+
+/// What the screen is drawn from besides the state: limits and resolved defaults per account. Reads
+/// files only; (local) `--launcher-options` and `--launcher-run` read the same.
+pub(super) fn launch_view(cfg: &Config, ctx: &PathCtx, version: VersionInfo, style: Style) -> LaunchView {
+    let canonical_root = cfg.canonical().map(|a| a.root.clone()).unwrap_or_default();
+    let settings = |root: &str| Path::new(root).join("settings.json");
+    let rate_dir = var("CLAUDE_AUTO_RATE_LIMITS_DIR").map_or_else(|| ctx.home.join(".claude").join("rate-limits"), PathBuf::from);
+    LaunchView {
+        limits: env::rate_limit_summary(&cfg.accounts, &rate_dir, now_ms()),
+        version,
+        default_model_label: env::default_model_label(&settings(&canonical_root)),
+        default_advisor_label: env::default_advisor_label(&settings(&canonical_root)),
+        labels_by_account: cfg
+            .accounts
+            .iter()
+            .map(|a| (a.key.clone(), env::default_labels(&settings(&a.root))))
+            .collect(),
+        style,
+    }
 }
 
 #[expect(clippy::too_many_arguments, reason = "the outcome record is assembled once, here")]

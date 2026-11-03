@@ -9,6 +9,7 @@ pub mod frame;
 pub mod input;
 pub mod invocation;
 pub mod launch;
+pub mod launcher_api;
 pub mod layout;
 pub mod list;
 pub mod log;
